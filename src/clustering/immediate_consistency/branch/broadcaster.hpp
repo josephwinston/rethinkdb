@@ -4,6 +4,7 @@
 
 #include <list>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "utils.hpp"
@@ -13,14 +14,27 @@
 #include "clustering/immediate_consistency/branch/history.hpp"
 #include "clustering/immediate_consistency/branch/metadata.hpp"
 #include "concurrency/queue/unlimited_fifo.hpp"
-#include "protocol_api.hpp"
 #include "timestamps.hpp"
 
-class ack_checker_t;
-template <class> class listener_t;
+class listener_t;
 template <class> class semilattice_readwrite_view_t;
-template <class> class multistore_ptr_t;
+class multistore_ptr_t;
 class mailbox_manager_t;
+class rdb_context_t;
+class uuid_u;
+
+class ack_checker_t : public home_thread_mixin_t {
+public:
+    virtual bool is_acceptable_ack_set(const std::set<peer_id_t> &acks) const = 0;
+    virtual write_durability_t get_write_durability(const peer_id_t &peer) const = 0;
+
+    ack_checker_t() { }
+protected:
+    virtual ~ack_checker_t() { }
+
+private:
+    DISABLE_COPYING(ack_checker_t);
+};
 
 /* Each shard has a `broadcaster_t` on its primary machine. Each machine sends
 queries via `cluster_namespace_interface_t` over the network to the `master_t`
@@ -33,7 +47,6 @@ on that branch. The order in which write and read operations pass through the
 `broadcaster_t` is the order in which they are performed at the B-trees
 themselves. */
 
-template<class protocol_t>
 class broadcaster_t : public home_thread_mixin_debug_only_t {
 private:
     class incomplete_write_t;
@@ -42,31 +55,38 @@ public:
     class write_callback_t {
     public:
         write_callback_t();
-        virtual void on_response(peer_id_t peer,
-            const typename protocol_t::write_response_t &response) = 0;
-        virtual void on_done() = 0;
+        /* `on_success()` is called when a sufficiently large set of replicas have
+        acknowledged the write, as judged by the `ack_checker_t` passed to
+        `spawn_write()`. */
+        virtual void on_success(const write_response_t &response) = 0;
+        /* `on_failure()` is called when the `ack_checker_t` cannot be satisfied. If
+        `might_have_run_anyway` is `true`, then the write might have been performed
+        anyway; if `might_have_run_anyway` is `false`, then the write definitely wasn't
+        performed. */
+        virtual void on_failure(bool might_have_run_anyway) = 0;
 
     protected:
         virtual ~write_callback_t();
 
     private:
         friend class broadcaster_t;
-        /* This is so that if the write callback is destroyed before `on_done()`
-        is called, it will get deregistered. */
+        /* This is so that if the write callback is destroyed before `on_success()` or
+        `on_failure()` is called, it will get deregistered. */
         incomplete_write_t *write;
     };
 
     broadcaster_t(
             mailbox_manager_t *mm,
-            branch_history_manager_t<protocol_t> *bhm,
-            store_view_t<protocol_t> *initial_svs,
+            rdb_context_t *rdb_context,
+            branch_history_manager_t *bhm,
+            store_view_t *initial_svs,
             perfmon_collection_t *parent_perfmon_collection,
             order_source_t *order_source,
             signal_t *interruptor) THROWS_ONLY(interrupted_exc_t);
 
     void read(
-        const typename protocol_t::read_t &r,
-        typename protocol_t::read_response_t *response,
+        const read_t &r,
+        read_response_t *response,
         fifo_enforcer_sink_t::exit_read_t *lock,
         order_token_t tok,
         signal_t *interruptor)
@@ -78,7 +98,7 @@ public:
     `write_callback_t` is destroyed while the write is still in progress, its
     destructor will automatically deregister it so that no segfaults will
     happen. */
-    void spawn_write(const typename protocol_t::write_t &w,
+    void spawn_write(const write_t &w,
                      fifo_enforcer_sink_t::exit_write_t *lock,
                      order_token_t tok,
                      write_callback_t *cb,
@@ -87,9 +107,13 @@ public:
 
     branch_id_t get_branch_id() const;
 
-    broadcaster_business_card_t<protocol_t> get_business_card();
+    broadcaster_business_card_t get_business_card();
 
-    MUST_USE store_view_t<protocol_t> *release_bootstrap_svs_for_listener();
+    MUST_USE store_view_t *release_bootstrap_svs_for_listener();
+
+    void register_local_listener(const uuid_u &listener_id,
+                                 listener_t *listener,
+                                 auto_drainer_t::lock_t listener_keepalive);
 
 private:
     class incomplete_write_ref_t;
@@ -121,19 +145,35 @@ private:
     void end_write(boost::shared_ptr<incomplete_write_t> write) THROWS_NOTHING;
 
     void single_read(
-        const typename protocol_t::read_t &r,
-        typename protocol_t::read_response_t *response,
+        const read_t &r,
+        read_response_t *response,
         fifo_enforcer_sink_t::exit_read_t *lock, order_token_t tok,
         signal_t *interruptor)
         THROWS_ONLY(cannot_perform_query_exc_t, interrupted_exc_t);
 
     void all_read(
-        const typename protocol_t::read_t &r,
-        typename protocol_t::read_response_t *response,
+        const read_t &r,
+        read_response_t *response,
         fifo_enforcer_sink_t::exit_read_t *lock, order_token_t tok,
         signal_t *interruptor)
         THROWS_ONLY(cannot_perform_query_exc_t, interrupted_exc_t);
 
+    void listener_read(
+        broadcaster_t::dispatchee_t *mirror,
+        const read_t &r, read_response_t *response, state_timestamp_t ts,
+        order_token_t order_token, fifo_enforcer_read_token_t token,
+        signal_t *interruptor)
+        THROWS_ONLY(interrupted_exc_t);
+
+    void listener_write(
+        broadcaster_t::dispatchee_t *mirror,
+        const write_t &w, transition_timestamp_t ts,
+        order_token_t order_token, fifo_enforcer_write_token_t token,
+        signal_t *interruptor)
+        THROWS_ONLY(interrupted_exc_t);
+
+    /* This recomputes `readable_dispatchees_as_set()` from `readable_dispatchees()` */
+    void refresh_readable_dispatchees_as_set();
 
     /* This function sanity-checks `incomplete_writes`, `current_timestamp`,
     and `newest_complete_timestamp`. It mostly exists as a form of executable
@@ -143,16 +183,18 @@ private:
     perfmon_collection_t broadcaster_collection;
     perfmon_membership_t broadcaster_membership;
 
-    mailbox_manager_t *mailbox_manager;
+    rdb_context_t *const rdb_context;
 
-    branch_id_t branch_id;
+    mailbox_manager_t *const mailbox_manager;
+
+    const branch_id_t branch_id;
 
     /* Until our initial listener has been constructed, this holds the
     store_view that was passed to our constructor. After that, it's
     `NULL`. */
-    store_view_t<protocol_t> *bootstrap_svs;
+    store_view_t *bootstrap_svs;
 
-    branch_history_manager_t<protocol_t> *branch_history_manager;
+    branch_history_manager_t *const branch_history_manager;
 
     /* If a write has begun, but some mirror might not have completed it yet,
     then it goes in `incomplete_writes`. The idea is that a new mirror that
@@ -175,7 +217,13 @@ private:
     std::map<dispatchee_t *, auto_drainer_t::lock_t> dispatchees;
     intrusive_list_t<dispatchee_t> readable_dispatchees;
 
-    registrar_t<listener_business_card_t<protocol_t>, broadcaster_t *, dispatchee_t>
+    /* This is just a set that contains the peer ID of each dispatchee in
+    `readable_dispatchees`. We keep it as a `std::set` because we need to pass it to
+    `ack_checker->is_acceptable_ack_set()` for every single write operation, and this
+    avoids the overhead of recreating the `std::set` each time. */
+    std::set<peer_id_t> readable_dispatchees_as_set;
+
+    registrar_t<listener_business_card_t, broadcaster_t *, dispatchee_t>
         registrar;
 
     DISABLE_COPYING(broadcaster_t);

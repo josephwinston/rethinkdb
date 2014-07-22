@@ -15,12 +15,9 @@ eviction_bag_t::~eviction_bag_t() {
     guarantee(size_ == 0, "size was %" PRIu64, size_);
 }
 
-void eviction_bag_t::add_without_size(page_t *page) {
-    bag_.add(page);
-}
-
-void eviction_bag_t::add_size(uint32_t ser_buf_size) {
-    size_ += ser_buf_size;
+void eviction_bag_t::change_size(int64_t adjustment) {
+    rassert(adjustment >= 0 || size_ >= static_cast<uint64_t>(-adjustment));
+    size_ += adjustment;
 }
 
 void eviction_bag_t::add(page_t *page, uint32_t ser_buf_size) {
@@ -40,7 +37,8 @@ bool eviction_bag_t::has_page(page_t *page) const {
     return bag_.has_element(page);
 }
 
-bool eviction_bag_t::remove_oldish(page_t **page_out, uint64_t access_time_offset) {
+bool eviction_bag_t::remove_oldish(page_t **page_out, uint64_t access_time_offset,
+                                   page_cache_t *page_cache) {
     if (bag_.size() == 0) {
         return false;
     } else {
@@ -50,13 +48,13 @@ bool eviction_bag_t::remove_oldish(page_t **page_out, uint64_t access_time_offse
             page_t *page = bag_.access_random(randsize(bag_.size()));
             // We compare relative to the access time offset, so that in the unlikely
             // event of a 64-bit overflow, performance degradation is "smooth".
-            if (access_time_offset - page->access_time_ >
-                access_time_offset - oldest->access_time_) {
+            if (access_time_offset - page->access_time() >
+                access_time_offset - oldest->access_time()) {
                 oldest = page;
             }
         }
 
-        remove(oldest, oldest->ser_buf_size_);
+        remove(oldest, oldest->hypothetical_memory_usage(page_cache));
         *page_out = oldest;
         return true;
     }

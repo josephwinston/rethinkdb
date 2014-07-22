@@ -3,6 +3,9 @@
 
 #include "arch/io/disk.hpp"
 #include "btree/operations.hpp"
+#include "btree/slice.hpp"
+#include "buffer_cache/alt/cache_balancer.hpp"
+#include "containers/binary_blob.hpp"
 #include "unittest/unittest_utils.hpp"
 #include "serializer/config.hpp"
 
@@ -30,6 +33,10 @@ std::string random_string() {
     return std::string(length, c);
 }
 
+binary_blob_t string_to_blob(const std::string &s) {
+    return binary_blob_t(s.data(), s.data() + s.size());
+}
+
 std::vector<char> string_to_vector(const std::string &s) {
     return std::vector<char>(s.data(), s.data() + s.size());
 }
@@ -53,8 +60,8 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
         &file_opener,
         &get_global_perfmon_collection());
 
-    cache_t cache(&serializer, alt_cache_config_t(),
-                  &get_global_perfmon_collection());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    cache_t cache(&serializer, &balancer, &get_global_perfmon_collection());
     cache_conn_t cache_conn(&cache);
 
     {
@@ -62,7 +69,7 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
         buf_lock_t superblock(&txn, SUPERBLOCK_ID, alt_create_t::create);
         buf_write_t sb_write(&superblock);
         btree_slice_t::init_superblock(&superblock,
-                                       std::vector<char>(), std::vector<char>());
+                                       std::vector<char>(), binary_blob_t());
     }
 
     std::map<std::string, std::string> mirror;
@@ -126,7 +133,7 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
             std::string key = random_existing_key(mirror);
             std::string value = random_string();
             set_superblock_metainfo(sb_buf, string_to_vector(key),
-                                    string_to_vector(value));
+                                    string_to_blob(value));
             mirror[key] = value;
             if (print_log_messages) {
                 printf("update '%s' = '%s'\n", key.c_str(), value.c_str());
@@ -138,7 +145,7 @@ TPTEST(BtreeMetainfo, MetainfoTest) {
             }
             std::string value = random_string();
             set_superblock_metainfo(sb_buf, string_to_vector(key),
-                                    string_to_vector(value));
+                                    string_to_blob(value));
             mirror[key] = value;
             if (print_log_messages) {
                 printf("insert '%s' = '%s'\n", key.c_str(), value.c_str());

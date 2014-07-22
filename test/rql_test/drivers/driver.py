@@ -1,17 +1,26 @@
-from sys import path
-import sys
-import pdb
-import collections
-import types
-import re
+import collections, os, pytz, re, sys, types
 from datetime import datetime
-import pytz
-path.insert(0, '.')
-from test_util import shard_table
-path.insert(0, "../../drivers/python")
 
-from os import environ
-import rethinkdb as r
+# -- import test resources - NOTE: these are path dependent
+
+stashedPath = sys.path
+
+# - test_util - TODO: replace with methods from common
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import test_util
+
+# - common
+
+sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, 'common')))
+import utils
+r = utils.import_pyton_driver()
+
+# -
+
+sys.path = stashedPath
+
+# --
 
 # JSPORT = int(sys.argv[1])
 CPPPORT = int(sys.argv[2])
@@ -30,7 +39,16 @@ def print_test_failure(test_name, test_src, message):
     print("TEST BODY: %s", test_src.encode('utf-8'))
     print(message)
     print('')
-    sys.exit(1)
+
+def check_pp(src, query):
+    # This isn't a good indicator because of lambdas, whitespace differences, etc
+    # But it will at least make sure that we don't crash when trying to print a query
+    printer = r.errors.QueryPrinter(query)
+    composed = printer.print_query()
+    #if composed != src:
+    #    print('Warning, pretty printing inconsistency:')
+    #    print("Source code: %s", src)
+    #    print("Printed query: %s", composed)
 
 class Lst:
     def __init__(self, lst):
@@ -236,6 +254,9 @@ class PyTestDriver:
 
             return # Can't continue with this test if there is no test query
 
+        # Check pretty-printing
+        check_pp(src, query)
+
         # Try actually running the test
         try:
             cppres = query.run(self.cpp_conn, **runopts)
@@ -294,7 +315,7 @@ def uuid():
     return Uuid()
 
 def shard(table_name):
-    shard_table(CLUSTER_PORT, BUILD, table_name)
+    test_util.shard_table(CLUSTER_PORT, BUILD, table_name)
 
 def int_cmp(i):
     return Int(i)

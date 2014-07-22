@@ -9,48 +9,25 @@
 #include <vector>
 
 #include "backfill_progress.hpp"
-#include "btree/btree_store.hpp"
+#include "concurrency/auto_drainer.hpp"
 #include "rdb_protocol/datum.hpp"
 #include "rdb_protocol/protocol.hpp"
+#include "rdb_protocol/store.hpp"
 
+class btree_slice_t;
+class deletion_context_t;
 class key_tester_t;
 class parallel_traversal_progress_t;
 template <class> class promise_t;
 struct rdb_value_t;
 
-typedef rdb_protocol_t::read_t read_t;
-typedef rdb_protocol_t::read_response_t read_response_t;
-
-typedef rdb_protocol_t::point_read_t point_read_t;
-typedef rdb_protocol_t::point_read_response_t point_read_response_t;
-
-typedef rdb_protocol_t::rget_read_t rget_read_t;
-typedef rdb_protocol_t::rget_read_response_t rget_read_response_t;
-
-typedef rdb_protocol_t::distribution_read_t distribution_read_t;
-typedef rdb_protocol_t::distribution_read_response_t distribution_read_response_t;
-
-typedef rdb_protocol_t::write_t write_t;
-typedef rdb_protocol_t::write_response_t write_response_t;
-
-typedef rdb_protocol_t::batched_replace_t batched_replace_t;
-typedef rdb_protocol_t::batched_insert_t batched_insert_t;
-typedef rdb_protocol_t::batched_replace_response_t batched_replace_response_t;
-
-typedef rdb_protocol_t::point_write_t point_write_t;
-typedef rdb_protocol_t::point_write_response_t point_write_response_t;
-
-typedef rdb_protocol_t::point_delete_t point_delete_t;
-typedef rdb_protocol_t::point_delete_response_t point_delete_response_t;
-
 class parallel_traversal_progress_t;
 
-bool btree_value_fits(block_size_t bs, int data_length, const rdb_value_t *value);
+bool btree_value_fits(max_block_size_t bs, int data_length, const rdb_value_t *value);
 
-template <>
-class value_sizer_t<rdb_value_t> : public value_sizer_t<void> {
+class rdb_value_sizer_t : public value_sizer_t {
 public:
-    explicit value_sizer_t<rdb_value_t>(block_size_t bs);
+    explicit rdb_value_sizer_t(max_block_size_t bs);
 
     static const rdb_value_t *as_rdb(const void *p);
 
@@ -64,14 +41,14 @@ public:
 
     block_magic_t btree_leaf_magic() const;
 
-    block_size_t block_size() const;
+    max_block_size_t block_size() const;
 
 private:
     // The block size.  It's convenient for leaf node code and for
     // some subclasses, too.
-    block_size_t block_size_;
+    max_block_size_t block_size_;
 
-    DISABLE_COPYING(value_sizer_t<rdb_value_t>);
+    DISABLE_COPYING(rdb_value_sizer_t);
 };
 
 struct rdb_modification_info_t;
@@ -159,7 +136,7 @@ public:
         repli_timestamp_t recency,
         signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
     virtual void on_keyvalues(
-        std::vector<rdb_protocol_details::backfill_atom_t> &&atoms,
+        std::vector<backfill_atom_t> &&atoms,
         signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
     virtual void on_sindexes(
         const std::map<std::string, secondary_index_t> &sindexes,
@@ -184,22 +161,13 @@ void rdb_delete(const store_key_t &key, btree_slice_t *slice, repli_timestamp_t
                 rdb_modification_info_t *mod_info,
                 profile::trace_t *trace);
 
-/* `rdb_erase_major_range` has a complexity of O(n) where n is the size of the
- * btree, if secondary indexes are present. Be careful when to use it. */
-void rdb_erase_major_range(key_tester_t *tester,
-                           const key_range_t &keys,
-                           buf_lock_t *sindex_block,
-                           superblock_t *superblock,
-                           btree_store_t<rdb_protocol_t> *store,
-                           signal_t *interruptor);
-
 /* `rdb_erase_small_range` has a complexity of O(log n * m) where n is the size of
  * the btree, and m is the number of documents actually being deleted.
- * It also requires O(m) memory. 
- * In contrast to `rdb_erase_major_range()`, it doesn't update secondary indexes
- * itself, but returns a number of modification reports that should be applied
- * to secondary indexes separately. Furthermore, it detaches blobs rather than
- * deleting them. */
+ * It also requires O(m) memory.
+ * It returns a number of modification reports that should be applied
+ * to secondary indexes separately. Blobs are detached, and should be deleted later
+ * if required (passing the modification reports to store_t::update_sindexes()
+ * takes care of that). */
 void rdb_erase_small_range(key_tester_t *tester,
                            const key_range_t &keys,
                            superblock_t *superblock,
@@ -207,29 +175,26 @@ void rdb_erase_small_range(key_tester_t *tester,
                            signal_t *interruptor,
                            std::vector<rdb_modification_report_t> *mod_reports_out);
 
-/* RGETS */
-size_t estimate_rget_response_size(const counted_t<const ql::datum_t> &datum);
-
 void rdb_rget_slice(
     btree_slice_t *slice,
     const key_range_t &range,
     superblock_t *superblock,
     ql::env_t *ql_env,
     const ql::batchspec_t &batchspec,
-    const std::vector<rdb_protocol_details::transform_variant_t> &transforms,
-    const boost::optional<rdb_protocol_details::terminal_variant_t> &terminal,
+    const std::vector<ql::transform_variant_t> &transforms,
+    const boost::optional<ql::terminal_variant_t> &terminal,
     sorting_t sorting,
     rget_read_response_t *response);
 
 void rdb_rget_secondary_slice(
     btree_slice_t *slice,
     const datum_range_t &datum_range,
-    const rdb_protocol_t::region_t &sindex_region,
+    const region_t &sindex_region,
     superblock_t *superblock,
     ql::env_t *ql_env,
     const ql::batchspec_t &batchspec,
-    const std::vector<rdb_protocol_details::transform_variant_t> &transforms,
-    const boost::optional<rdb_protocol_details::terminal_variant_t> &terminal,
+    const std::vector<ql::transform_variant_t> &transforms,
+    const boost::optional<ql::terminal_variant_t> &terminal,
     const key_range_t &pk_range,
     sorting_t sorting,
     const ql::map_wire_func_t &sindex_func,
@@ -248,9 +213,9 @@ struct rdb_modification_info_t {
                       std::vector<char> > data_pair_t;
     data_pair_t deleted;
     data_pair_t added;
-
-    RDB_DECLARE_ME_SERIALIZABLE;
 };
+
+RDB_DECLARE_SERIALIZABLE(rdb_modification_info_t);
 
 struct rdb_modification_report_t {
     rdb_modification_report_t() { }
@@ -259,30 +224,23 @@ struct rdb_modification_report_t {
 
     store_key_t primary_key;
     rdb_modification_info_t info;
-
-    RDB_DECLARE_ME_SERIALIZABLE;
 };
 
+RDB_DECLARE_SERIALIZABLE(rdb_modification_report_t);
 
-struct rdb_erase_major_range_report_t {
-    rdb_erase_major_range_report_t() { }
-    explicit rdb_erase_major_range_report_t(const key_range_t &_range_to_erase)
-        : range_to_erase(_range_to_erase) { }
-    key_range_t range_to_erase;
-
-    RDB_DECLARE_ME_SERIALIZABLE;
-};
-
-typedef boost::variant<rdb_modification_report_t,
-                       rdb_erase_major_range_report_t>
-        rdb_sindex_change_t;
+void serialize_sindex_info(write_message_t *wm,
+                           const ql::map_wire_func_t &mapping,
+                           const sindex_multi_bool_t &multi);
+void deserialize_sindex_info(const std::vector<char> &data,
+                             ql::map_wire_func_t *mapping,
+                             sindex_multi_bool_t *multi);
 
 /* An rdb_modification_cb_t is passed to BTree operations and allows them to
  * modify the secondary while they perform an operation. */
 class rdb_modification_report_cb_t {
 public:
     rdb_modification_report_cb_t(
-            btree_store_t<rdb_protocol_t> *store,
+            store_t *store,
             buf_lock_t *sindex_block,
             auto_drainer_t::lock_t lock);
 
@@ -291,29 +249,25 @@ public:
     ~rdb_modification_report_cb_t();
 
 private:
+    void on_mod_report_sub(const rdb_modification_report_t &, cond_t *);
+
     /* Fields initialized by the constructor. */
     auto_drainer_t::lock_t lock_;
-    btree_store_t<rdb_protocol_t> *store_;
+    store_t *store_;
     buf_lock_t *sindex_block_;
 
     /* Fields initialized by calls to on_mod_report */
-    btree_store_t<rdb_protocol_t>::sindex_access_vector_t sindexes_;
+    store_t::sindex_access_vector_t sindexes_;
 };
 
 void rdb_update_sindexes(
-        const btree_store_t<rdb_protocol_t>::sindex_access_vector_t &sindexes,
+        const store_t::sindex_access_vector_t &sindexes,
         const rdb_modification_report_t *modification,
         txn_t *txn,
         const deletion_context_t *deletion_context);
 
-
-void rdb_erase_major_range_sindexes(
-        const btree_store_t<rdb_protocol_t>::sindex_access_vector_t &sindexes,
-        const rdb_erase_major_range_report_t *erase_range,
-        signal_t *interruptor, const value_deleter_t *deleter);
-
 void post_construct_secondary_indexes(
-        btree_store_t<rdb_protocol_t> *store,
+        store_t *store,
         const std::set<uuid_u> &sindexes_to_post_construct,
         signal_t *interruptor)
     THROWS_ONLY(interrupted_exc_t);
@@ -336,6 +290,7 @@ public:
  * the post_deleter. */
 class rdb_live_deletion_context_t : public deletion_context_t {
 public:
+    rdb_live_deletion_context_t() { }
     const value_deleter_t *balancing_detacher() const { return &detacher; }
     const value_deleter_t *in_tree_deleter() const { return &detacher; }
     const value_deleter_t *post_deleter() const { return &deleter; }
@@ -347,14 +302,16 @@ private:
 /* Used for operations on secondary indexes that aren't yet post-constructed.
  * Since we don't have any guarantees that referenced blob blocks still exist
  * during that stage, we use noop deleters for everything. */
-class rdb_post_construction_deletion_context_t : public deletion_context_t {
+class rdb_noop_deletion_context_t : public deletion_context_t {
 public:
+    rdb_noop_deletion_context_t() { }
     const value_deleter_t *balancing_detacher() const { return &no_deleter; }
     const value_deleter_t *in_tree_deleter() const { return &no_deleter; }
     const value_deleter_t *post_deleter() const { return &no_deleter; }
 private:
     noop_value_deleter_t no_deleter;
 };
+typedef rdb_noop_deletion_context_t rdb_post_construction_deletion_context_t;
 
 
 #endif /* RDB_PROTOCOL_BTREE_HPP_ */

@@ -3,140 +3,110 @@
 
 #include "errors.hpp"
 #include <boost/bind.hpp>
-#include <boost/ptr_container/ptr_map.hpp>
 
 #include "arch/timing.hpp"
 #include "clustering/administration/namespace_metadata.hpp"
 #include "clustering/reactor/namespace_interface.hpp"
 #include "concurrency/cross_thread_signal.hpp"
 #include "concurrency/cross_thread_watchable.hpp"
+#include "rdb_protocol/protocol.hpp"
 
 #define NAMESPACE_INTERFACE_EXPIRATION_MS (60 * 1000)
 
-template <class protocol_t>
-struct namespace_repo_t<protocol_t>::namespace_cache_t {
+struct namespace_repo_t::namespace_cache_t {
 public:
-    boost::ptr_map<namespace_id_t, typename base_namespace_repo_t<protocol_t>::namespace_cache_entry_t> entries;
+    std::map<namespace_id_t,
+             scoped_ptr_t<base_namespace_repo_t::namespace_cache_entry_t> > entries;
     auto_drainer_t drainer;
 };
 
 
-template <class protocol_t>
-namespace_repo_t<protocol_t>::namespace_repo_t(mailbox_manager_t *_mailbox_manager,
-                                               clone_ptr_t<watchable_t<change_tracking_map_t<peer_id_t, namespaces_directory_metadata_t<protocol_t> > > > _namespaces_directory_metadata,
-                                               typename protocol_t::context_t *_ctx)
+namespace_repo_t::namespace_repo_t(mailbox_manager_t *_mailbox_manager,
+                                   const boost::shared_ptr<semilattice_read_view_t<cow_ptr_t<namespaces_semilattice_metadata_t> > > &semilattice_view,
+                                   clone_ptr_t<watchable_t<change_tracking_map_t<peer_id_t, namespaces_directory_metadata_t> > > _namespaces_directory_metadata,
+                                   rdb_context_t *_ctx)
     : mailbox_manager(_mailbox_manager),
+      namespaces_view(semilattice_view),
       namespaces_directory_metadata(_namespaces_directory_metadata),
-      ctx(_ctx)
-{ }
+      ctx(_ctx),
+      namespaces_subscription(boost::bind(&namespace_repo_t::on_namespaces_change, this, drainer.lock()))
+{
+    namespaces_subscription.reset(namespaces_view);
+}
 
-template <class protocol_t>
-namespace_repo_t<protocol_t>::~namespace_repo_t() { }
+namespace_repo_t::~namespace_repo_t() { }
 
-template <class protocol_t>
-std::map<peer_id_t, cow_ptr_t<reactor_business_card_t<protocol_t> > > get_reactor_business_cards(
-        const change_tracking_map_t<peer_id_t, namespaces_directory_metadata_t<protocol_t> > &ns_directory_metadata, const namespace_id_t &n_id) {
-    std::map<peer_id_t, cow_ptr_t<reactor_business_card_t<protocol_t> > > res;
-    for (typename std::map<peer_id_t, namespaces_directory_metadata_t<protocol_t> >::const_iterator it  = ns_directory_metadata.get_inner().begin();
-                                                                                                    it != ns_directory_metadata.get_inner().end();
-                                                                                                    it++) {
-        typename namespaces_directory_metadata_t<protocol_t>::reactor_bcards_map_t::const_iterator jt =
+bool namespace_repo_t::check_namespace_exists(const uuid_u &ns_id,
+                                              UNUSED signal_t *interruptor) {
+    on_thread_t rethread(namespaces_view->home_thread());
+    cow_ptr_t<namespaces_semilattice_metadata_t> metadata = namespaces_view->get();
+    cow_ptr_t<namespaces_semilattice_metadata_t>::change_t change(&metadata);
+    auto nsi = change.get()->namespaces.find(ns_id);
+    if (nsi == change.get()->namespaces.end()) return false;
+    if (nsi->second.is_deleted()) return false;
+    return true;
+}
+
+std::map<peer_id_t, cow_ptr_t<reactor_business_card_t> > get_reactor_business_cards(
+        const change_tracking_map_t<peer_id_t, namespaces_directory_metadata_t> &ns_directory_metadata, const namespace_id_t &n_id) {
+    std::map<peer_id_t, cow_ptr_t<reactor_business_card_t> > res;
+    for (std::map<peer_id_t, namespaces_directory_metadata_t>::const_iterator it  = ns_directory_metadata.get_inner().begin();
+         it != ns_directory_metadata.get_inner().end();
+         ++it) {
+        namespaces_directory_metadata_t::reactor_bcards_map_t::const_iterator jt =
             it->second.reactor_bcards.find(n_id);
         if (jt != it->second.reactor_bcards.end()) {
             res[it->first] = jt->second.internal;
         } else {
-            res[it->first] = cow_ptr_t<reactor_business_card_t<protocol_t> >();
+            res[it->first] = cow_ptr_t<reactor_business_card_t>();
         }
     }
 
     return res;
 }
 
-template <class protocol_t>
-base_namespace_repo_t<protocol_t>::access_t::access_t() :
-    cache_entry(NULL),
-    thread(INVALID_THREAD)
-    { }
-
-template<class protocol_t>
-base_namespace_repo_t<protocol_t>::access_t::access_t(base_namespace_repo_t *parent, const uuid_u &namespace_id, signal_t *interruptor) :
-    thread(get_thread_id())
-{
-    {
-        ASSERT_FINITE_CORO_WAITING;
-        cache_entry = parent->get_cache_entry(namespace_id);
-        ref_handler.init(cache_entry);
-    }
-    wait_interruptible(cache_entry->namespace_if.get_ready_signal(), interruptor);
+void copy_region_maps_to_thread(
+        const std::map<namespace_id_t, std::map<key_range_t, machine_id_t> > &from,
+        one_per_thread_t<std::map<namespace_id_t, std::map<key_range_t, machine_id_t> > > *to,
+        int thread, UNUSED auto_drainer_t::lock_t keepalive) {
+    on_thread_t th((threadnum_t(thread)));
+    *to->get() = from;
 }
 
-template <class protocol_t>
-base_namespace_repo_t<protocol_t>::access_t::access_t(const access_t& access) :
-    cache_entry(access.cache_entry),
-    thread(access.thread)
-{
-    if (cache_entry) {
-        rassert(get_thread_id() == thread);
-        ref_handler.init(cache_entry);
-    }
-}
-
-template <class protocol_t>
-typename base_namespace_repo_t<protocol_t>::access_t &base_namespace_repo_t<protocol_t>::access_t::operator=(const access_t &access) {
-    if (this != &access) {
-        cache_entry = access.cache_entry;
-        ref_handler.reset();
-        if (access.cache_entry) {
-            ref_handler.init(access.cache_entry);
-        }
-        thread = access.thread;
-    }
-    return *this;
-}
-
-template <class protocol_t>
-namespace_interface_t<protocol_t> *base_namespace_repo_t<protocol_t>::access_t::get_namespace_if() {
-    rassert(thread == get_thread_id());
-    return cache_entry->namespace_if.wait();
-}
-
-template <class protocol_t>
-base_namespace_repo_t<protocol_t>::access_t::ref_handler_t::ref_handler_t() :
-    ref_target(NULL) { }
-
-template <class protocol_t>
-base_namespace_repo_t<protocol_t>::access_t::ref_handler_t::~ref_handler_t() {
-    reset();
-}
-
-template <class protocol_t>
-void base_namespace_repo_t<protocol_t>::access_t::ref_handler_t::init(namespace_cache_entry_t *_ref_target) {
+void namespace_repo_t::on_namespaces_change(auto_drainer_t::lock_t keepalive) {
     ASSERT_NO_CORO_WAITING;
-    guarantee(ref_target == NULL);
-    ref_target = _ref_target;
-    ref_target->ref_count++;
-    if (ref_target->ref_count == 1) {
-        if (ref_target->pulse_when_ref_count_becomes_nonzero) {
-            ref_target->pulse_when_ref_count_becomes_nonzero->pulse_if_not_already_pulsed();
-        }
-    }
-}
+    std::map<namespace_id_t, std::map<key_range_t, machine_id_t> > new_reg_to_pri_maps;
 
-template <class protocol_t>
-void base_namespace_repo_t<protocol_t>::access_t::ref_handler_t::reset() {
-    ASSERT_NO_CORO_WAITING;
-    if (ref_target != NULL) {
-        ref_target->ref_count--;
-        if (ref_target->ref_count == 0) {
-            if (ref_target->pulse_when_ref_count_becomes_zero) {
-                ref_target->pulse_when_ref_count_becomes_zero->pulse_if_not_already_pulsed();
+    namespaces_semilattice_metadata_t::namespace_map_t::const_iterator it;
+    const namespaces_semilattice_metadata_t::namespace_map_t &ns = namespaces_view.get()->get().get()->namespaces;
+    for (it = ns.begin(); it != ns.end(); ++it) {
+        if (it->second.is_deleted()) {
+            continue;
+        }
+
+        const persistable_blueprint_t &bp = it->second.get_ref().blueprint.get_ref();
+        persistable_blueprint_t::role_map_t::const_iterator it2;
+        for (it2 = bp.machines_roles.begin(); it2 != bp.machines_roles.end(); ++it2) {
+            const persistable_blueprint_t::region_to_role_map_t &roles = it2->second;
+            persistable_blueprint_t::region_to_role_map_t::const_iterator it3;
+            for (it3 = roles.begin(); it3 != roles.end(); ++it3) {
+                if (it3->second == blueprint_role_t::blueprint_role_primary) {
+                    new_reg_to_pri_maps[it->first][it3->first.inner] = it2->first;
+                }
             }
         }
     }
+
+    for (int thread = 0; thread < get_num_threads(); ++thread) {
+        coro_t::spawn_ordered(std::bind(&copy_region_maps_to_thread,
+                                        new_reg_to_pri_maps,
+                                        &region_to_primary_maps,
+                                        thread,
+                                        keepalive));
+    }
 }
 
-template <class protocol_t>
-void namespace_repo_t<protocol_t>::create_and_destroy_namespace_interface(
+void namespace_repo_t::create_and_destroy_namespace_interface(
             namespace_cache_t *cache,
             const uuid_u &namespace_id,
             auto_drainer_t::lock_t keepalive)
@@ -144,21 +114,23 @@ void namespace_repo_t<protocol_t>::create_and_destroy_namespace_interface(
     keepalive.assert_is_holding(&cache->drainer);
     threadnum_t thread = get_thread_id();
 
-    typename base_namespace_repo_t<protocol_t>::namespace_cache_entry_t *cache_entry = cache->entries.find(namespace_id)->second;
+    base_namespace_repo_t::namespace_cache_entry_t *cache_entry = cache->entries.find(namespace_id)->second.get();
     guarantee(!cache_entry->namespace_if.get_ready_signal()->is_pulsed());
 
     /* We need to switch to `home_thread()` to construct
     `cross_thread_watchable`, then switch back. In destruction we need to do the
     reverse. Fortunately RAII works really nicely here. */
     on_thread_t switch_to_home_thread(home_thread());
-    clone_ptr_t<watchable_t<std::map<peer_id_t, cow_ptr_t<reactor_business_card_t<protocol_t> > > > > subview =
-        namespaces_directory_metadata->subview(boost::bind(&get_reactor_business_cards<protocol_t>, _1, namespace_id));
-    cross_thread_watchable_variable_t<std::map<peer_id_t, cow_ptr_t<reactor_business_card_t<protocol_t> > > > cross_thread_watchable(subview, thread);
+    clone_ptr_t<watchable_t<std::map<peer_id_t, cow_ptr_t<reactor_business_card_t> > > > subview =
+        namespaces_directory_metadata->subview(boost::bind(&get_reactor_business_cards, _1, namespace_id));
+    cross_thread_watchable_variable_t<std::map<peer_id_t, cow_ptr_t<reactor_business_card_t> > > cross_thread_watchable(subview, thread);
     on_thread_t switch_back(thread);
 
-    cluster_namespace_interface_t<protocol_t> namespace_interface(
+    cluster_namespace_interface_t namespace_interface(
         mailbox_manager,
+        region_to_primary_maps.get(),
         cross_thread_watchable.get_watchable(),
+        namespace_id,
         ctx);
 
     try {
@@ -204,37 +176,25 @@ void namespace_repo_t<protocol_t>::create_and_destroy_namespace_interface(
     cache->entries.erase(namespace_id);
 }
 
-template <class protocol_t>
-typename base_namespace_repo_t<protocol_t>::namespace_cache_entry_t *namespace_repo_t<protocol_t>::get_cache_entry(const uuid_u &ns_id) {
-    typename base_namespace_repo_t<protocol_t>::namespace_cache_entry_t *cache_entry;
+base_namespace_repo_t::namespace_cache_entry_t *namespace_repo_t::get_cache_entry(const uuid_u &ns_id) {
+    base_namespace_repo_t::namespace_cache_entry_t *cache_entry;
     namespace_cache_t *cache = namespace_caches.get();
     if (cache->entries.find(ns_id) == cache->entries.end()) {
-        cache_entry = new typename base_namespace_repo_t<protocol_t>::namespace_cache_entry_t;
+        cache_entry = new base_namespace_repo_t::namespace_cache_entry_t;
         cache_entry->ref_count = 0;
         cache_entry->pulse_when_ref_count_becomes_zero = NULL;
         cache_entry->pulse_when_ref_count_becomes_nonzero = NULL;
 
         namespace_id_t id(ns_id);
-        cache->entries.insert(id, cache_entry);
+        cache->entries.insert(std::make_pair(id, scoped_ptr_t<base_namespace_repo_t::namespace_cache_entry_t>(cache_entry)));
 
         coro_t::spawn_sometime(boost::bind(
-            &namespace_repo_t<protocol_t>::create_and_destroy_namespace_interface, this,
+            &namespace_repo_t::create_and_destroy_namespace_interface, this,
             cache, ns_id,
             auto_drainer_t::lock_t(&cache->drainer)));
     } else {
-        cache_entry = &cache->entries[ns_id];
+        cache_entry = cache->entries[ns_id].get();
     }
 
     return cache_entry;
 }
-
-#include "mock/dummy_protocol.hpp"
-#include "memcached/protocol.hpp"
-#include "rdb_protocol/protocol.hpp"
-
-template class base_namespace_repo_t<mock::dummy_protocol_t>;
-template class base_namespace_repo_t<memcached_protocol_t>;
-template class base_namespace_repo_t<rdb_protocol_t>;
-template class namespace_repo_t<mock::dummy_protocol_t>;
-template class namespace_repo_t<memcached_protocol_t>;
-template class namespace_repo_t<rdb_protocol_t>;

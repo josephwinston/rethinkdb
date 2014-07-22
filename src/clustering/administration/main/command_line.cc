@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <limits.h>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/stat.h>
@@ -18,7 +19,16 @@
 #include <sys/sysctl.h>
 #endif
 
+// Needed for determining available RAM for default cache size
+#if defined(__MACH__)
+#include <mach/host_info.h>
+#include <mach/mach_host.h>
+#endif
+
 #include <functional>
+#include <limits>
+
+#include <re2/re2.h>
 
 #include "arch/io/disk.hpp"
 #include "arch/os_signal.hpp"
@@ -35,7 +45,6 @@
 #include "clustering/administration/main/path.hpp"
 #include "clustering/administration/persist.hpp"
 #include "logger.hpp"
-#include "mock/dummy_protocol.hpp"
 
 #define RETHINKDB_EXPORT_SCRIPT "rethinkdb-export"
 #define RETHINKDB_IMPORT_SCRIPT "rethinkdb-import"
@@ -71,8 +80,8 @@ int check_pid_file(const std::string &pid_filepath) {
     }
 
     // Make a copy of the filename since `dirname` may modify it
-    char pid_dir[PATH_MAX + 1];
-    strncpy(pid_dir, pid_filepath.c_str(), PATH_MAX + 1);
+    char pid_dir[PATH_MAX];
+    strncpy(pid_dir, pid_filepath.c_str(), PATH_MAX);
     if (access(dirname(pid_dir), W_OK) == -1) {
         logERR("Cannot access the pid-file directory.");
         return EXIT_FAILURE;
@@ -181,7 +190,7 @@ bool get_group_id(const char *name, gid_t *group_id_out) {
 // Returns false if the user was not found.  This function replaces a call to
 // getpwnam(3).  That's right, getpwnam_r's interface is such that you have to
 // go through these shenanigans.
-bool get_user_ids(const char *name, int *user_id_out, gid_t *user_group_id_out) {
+bool get_user_ids(const char *name, uid_t *user_id_out, gid_t *user_group_id_out) {
     // On Linux we can use sysconf to learn what the bufsize should be but on OS
     // X we just have to guess.
     size_t bufsize = 4096;
@@ -224,42 +233,81 @@ bool get_user_ids(const char *name, int *user_id_out, gid_t *user_group_id_out) 
     return false;
 }
 
-
-void set_user_group(const std::map<std::string, options::values_t> &opts) {
+void get_user_group(const std::map<std::string, options::values_t> &opts,
+                    gid_t *group_id_out, std::string *group_name_out,
+                    uid_t *user_id_out, std::string *user_name_out) {
     boost::optional<std::string> rungroup = get_optional_option(opts, "--rungroup");
     boost::optional<std::string> runuser = get_optional_option(opts, "--runuser");
+    group_name_out->clear();
+    user_name_out->clear();
 
     if (rungroup) {
-        gid_t group_id;
-        if (!get_group_id(rungroup->c_str(), &group_id)) {
+        group_name_out->assign(*rungroup);
+        if (!get_group_id(rungroup->c_str(), group_id_out)) {
             throw std::runtime_error(strprintf("Group '%s' not found: %s",
-                                               rungroup->c_str(), errno_string(get_errno()).c_str()).c_str());
+                                               rungroup->c_str(),
+                                               errno_string(get_errno()).c_str()).c_str());
         }
-        if (setgid(group_id) != 0) {
-            throw std::runtime_error(strprintf("Could not set group to '%s': %s",
-                                               rungroup->c_str(), errno_string(get_errno()).c_str()).c_str());
-        }
+    } else {
+        *group_id_out = INVALID_GID;
     }
 
     if (runuser) {
-        int user_id;
+        user_name_out->assign(*runuser);
         gid_t user_group_id;
-        if (!get_user_ids(runuser->c_str(), &user_id, &user_group_id)) {
+        if (!get_user_ids(runuser->c_str(), user_id_out, &user_group_id)) {
             throw std::runtime_error(strprintf("User '%s' not found: %s",
-                                               runuser->c_str(), errno_string(get_errno()).c_str()).c_str());
+                                               runuser->c_str(),
+                                               errno_string(get_errno()).c_str()).c_str());
         }
         if (!rungroup) {
             // No group specified, use the user's group
-            if (setgid(user_group_id) != 0) {
-                throw std::runtime_error(strprintf("Could not use the group of user '%s': %s",
-                                                   runuser->c_str(), errno_string(get_errno()).c_str()).c_str());
-            }
+            group_name_out->assign(*runuser);
+            *group_id_out = user_group_id;
         }
-        if (setuid(user_id) != 0) {
-            throw std::runtime_error(strprintf("Could not set user account to '%s': %s",
-                                               runuser->c_str(), errno_string(get_errno()).c_str()).c_str());
+    } else {
+        *user_id_out = INVALID_UID;
+    }
+}
+
+void set_user_group(gid_t group_id, const std::string &group_name,
+                    uid_t user_id, const std::string user_name) {
+    if (group_id != INVALID_GID) {
+        if (setgid(group_id) != 0) {
+            throw std::runtime_error(strprintf("Could not set group to '%s': %s",
+                                               group_name.c_str(),
+                                               errno_string(get_errno()).c_str()).c_str());
         }
     }
+
+    if (user_id != INVALID_UID) {
+        if (setuid(user_id) != 0) {
+            throw std::runtime_error(strprintf("Could not set user account to '%s': %s",
+                                               user_name.c_str(),
+                                               errno_string(get_errno()).c_str()).c_str());
+        }
+    }
+}
+
+void get_and_set_user_group(const std::map<std::string, options::values_t> &opts) {
+    std::string group_name, user_name;
+    gid_t group_id;
+    uid_t user_id;
+
+    get_user_group(opts, &group_id, &group_name, &user_id, &user_name);
+    set_user_group(group_id, group_name, user_id, user_name);
+}
+
+void get_and_set_user_group_and_directory(
+        const std::map<std::string, options::values_t> &opts,
+        directory_lock_t *directory_lock) {
+    std::string group_name, user_name;
+    gid_t group_id;
+    uid_t user_id;
+
+    get_user_group(opts, &group_id, &group_name, &user_id, &user_name);
+    directory_lock->change_ownership(group_id, group_name, user_id, user_name);
+    set_user_group(group_id, group_name, user_id, user_name);
 }
 
 int check_pid_file(const std::map<std::string, options::values_t> &opts) {
@@ -302,23 +350,6 @@ std::string get_single_option(const std::map<std::string, options::values_t> &op
     std::string source;
     return get_single_option(opts, name, &source);
 }
-
-class serve_info_t {
-public:
-    serve_info_t(const std::vector<host_and_port_t> &_joins,
-                 service_address_ports_t _ports,
-                 std::string _web_assets,
-                 boost::optional<std::string> _config_file):
-        joins(&_joins),
-        ports(_ports),
-        web_assets(_web_assets),
-        config_file(_config_file) { }
-
-    const std::vector<host_and_port_t> *joins;
-    service_address_ports_t ports;
-    std::string web_assets;
-    boost::optional<std::string> config_file;
-};
 
 // Used for options that don't take parameters, such as --help or --exit-failure, tells whether the
 // option exists.
@@ -399,6 +430,52 @@ std::string get_web_path(const std::map<std::string, options::values_t> &opts, c
         return get_web_path(web_static_directory, argv);
     }
     return std::string();
+}
+
+uint64_t get_avail_mem_size() {
+    uint64_t page_size = sysconf(_SC_PAGESIZE);
+
+#if defined(__MACH__)
+    mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
+    vm_statistics_data_t vmstat;
+    if (KERN_SUCCESS != host_statistics(mach_host_self(), HOST_VM_INFO, (host_info_t)&vmstat, &count)) {
+        fprintf(stderr, "ERROR: could not determine available RAM for the default cache size (errno=%d).\n", get_errno());
+        return 1024 * MEGABYTE;
+    }
+    return vmstat.free_count * page_size;
+#else
+    uint64_t avail_mem_pages = sysconf(_SC_AVPHYS_PAGES);
+    return avail_mem_pages * page_size;
+#endif
+}
+
+uint64_t get_total_cache_size(const std::map<std::string, options::values_t> &opts) {
+    uint64_t cache_limit = std::numeric_limits<intptr_t>::max();
+    int64_t available_mem = get_avail_mem_size();
+
+    // Default to half the available memory minus a gigabyte, to leave room for server
+    // and query overhead, but never default to less than 100 megabytes
+    int64_t signed_res = std::min<int64_t>(available_mem - GIGABYTE, cache_limit) / DEFAULT_MAX_CACHE_RATIO;
+    uint64_t res = std::max<int64_t>(signed_res, 100 * MEGABYTE);
+
+    if (exists_option(opts, "--cache-size")) {
+        std::string cache_size_opt = get_single_option(opts, "--cache-size");
+        if (!strtou64_strict(cache_size_opt, 10, &res)) {
+            throw std::runtime_error(strprintf(
+                    "ERROR: could not parse cache-size as a number (%s)",
+                    cache_size_opt.c_str()));
+        }
+        res = res * MEGABYTE;
+
+        if (res > cache_limit) {
+            throw std::runtime_error(strprintf(
+                    "Requested cache size (%" PRIu64 " MB) is higher than the "
+                    "expected upper-bound for this platform (%" PRIu64" MB).",
+                    res / 1024 / 1024, cache_limit / 1024 / 1024));
+        }
+    }
+
+    return res;
 }
 
 // Note that this defaults to the peer port if no port is specified
@@ -641,16 +718,6 @@ void run_rethinkdb_create(const base_path_t &base_path,
     }
 }
 
-peer_address_set_t look_up_peers_addresses(const std::vector<host_and_port_t> &names) {
-    peer_address_set_t peers;
-    for (size_t i = 0; i < names.size(); ++i) {
-        std::set<host_and_port_t> peer_host;
-        peer_host.insert(names[i]);
-        peers.insert(peer_address_t(peer_host));
-    }
-    return peers;
-}
-
 void run_rethinkdb_admin(const std::vector<host_and_port_t> &joins,
                          const peer_address_t &canonical_addresses,
                          int client_port,
@@ -698,7 +765,7 @@ std::string uname_msr() {
     FILE *out = popen("uname -msr", "r");
     if (!out) return unknown;
     if (!fgets(buf, sizeof(buf), out)) {
-        pclose(out);    
+        pclose(out);
         return unknown;
     }
     pclose(out);
@@ -706,9 +773,10 @@ std::string uname_msr() {
 }
 
 void run_rethinkdb_serve(const base_path_t &base_path,
-                         const serve_info_t &serve_info,
+                         serve_info_t *serve_info,
                          const file_direct_io_mode_t direct_io_mode,
                          const int max_concurrent_io_requests,
+                         const uint64_t total_cache_size,
                          const machine_id_t *our_machine_id,
                          const cluster_semilattice_metadata_t *cluster_metadata,
                          directory_lock_t *data_directory_lock,
@@ -716,6 +784,25 @@ void run_rethinkdb_serve(const base_path_t &base_path,
     logINF("Running %s...\n", RETHINKDB_VERSION_STR);
     logINF("Running on %s", uname_msr().c_str());
     os_signal_cond_t sigint_cond;
+
+    logINF("Using cache size of %" PRIu64 " MB",
+           total_cache_size / static_cast<uint64_t>(MEGABYTE));
+
+    // Provide some warnings if the cache size or available memory seem inadequate
+    // We can't *really* tell what could go wrong given that we don't know how much data
+    // or what kind of queries will be run, so these are just somewhat reasonable values.
+    uint64_t available_memory = get_avail_mem_size();
+    if (total_cache_size > get_avail_mem_size()) {
+        logWRN("Requested cache size is larger than available memory.");
+    } else if (total_cache_size + GIGABYTE > get_avail_mem_size()) {
+        logWRN("Cache size does not leave much memory for server and query "
+               "overhead (available memory: %" PRIu64 " MB).",
+               available_memory / static_cast<uint64_t>(MEGABYTE));
+    }
+    if (total_cache_size <= 100 * MEGABYTE) {
+        logWRN("Cache size is very low and may impact performance.");
+    }
+
 
     logINF("Loading data from directory %s\n", base_path.path().c_str());
 
@@ -757,15 +844,14 @@ void run_rethinkdb_serve(const base_path_t &base_path,
         //  otherwise delete an uninitialized directory
         data_directory_lock->directory_initialized();
 
+        serve_info->look_up_peers();
         *result_out = serve(&io_backender,
                             base_path,
                             cluster_metadata_file.get(),
                             auth_metadata_file.get(),
-                            look_up_peers_addresses(*serve_info.joins),
-                            serve_info.ports,
-                            serve_info.web_assets,
-                            &sigint_cond,
-                            serve_info.config_file);
+                            total_cache_size,
+                            *serve_info,
+                            &sigint_cond);
 
     } catch (const metadata_persistence::file_in_use_exc_t &ex) {
         logINF("Directory '%s' is in use by another rethinkdb process.\n", base_path.path().c_str());
@@ -780,17 +866,18 @@ void run_rethinkdb_porcelain(const base_path_t &base_path,
                              const name_string_t &machine_name,
                              const file_direct_io_mode_t direct_io_mode,
                              const int max_concurrent_io_requests,
+                             const uint64_t total_cache_size,
                              const bool new_directory,
-                             const serve_info_t &serve_info,
+                             serve_info_t *serve_info,
                              directory_lock_t *data_directory_lock,
                              bool *const result_out) {
     if (!new_directory) {
-        run_rethinkdb_serve(base_path, serve_info,
-                            direct_io_mode, max_concurrent_io_requests,
+        run_rethinkdb_serve(base_path, serve_info, direct_io_mode,
+                            max_concurrent_io_requests, total_cache_size,
                             NULL, NULL, data_directory_lock,
                             result_out);
     } else {
-        logINF("Creating directory %s\n", base_path.path().c_str());
+        logINF("Initializing directory %s\n", base_path.path().c_str());
 
         machine_id_t our_machine_id = generate_uuid();
 
@@ -801,9 +888,9 @@ void run_rethinkdb_porcelain(const base_path_t &base_path,
         our_machine_metadata.datacenter = vclock_t<datacenter_id_t>(nil_uuid(), our_machine_id);
         cluster_metadata.machines.machines.insert(std::make_pair(our_machine_id, make_deletable(our_machine_metadata)));
 
-        if (serve_info.joins->empty()) {
+        if (serve_info->joins.empty()) {
             logINF("Creating a default database for your convenience. (This is because you ran 'rethinkdb' "
-                   "without 'create', 'serve', or '--join', and the directory '%s' did not already exist.)\n",
+                   "without 'create', 'serve', or '--join', and the directory '%s' did not already exist or is empty.)\n",
                    base_path.path().c_str());
 
             /* Create a test database. */
@@ -818,23 +905,21 @@ void run_rethinkdb_porcelain(const base_path_t &base_path,
                 deletable_t<database_semilattice_metadata_t>(database_metadata)));
         }
 
-        run_rethinkdb_serve(base_path, serve_info,
-                            direct_io_mode, max_concurrent_io_requests,
+        run_rethinkdb_serve(base_path, serve_info, direct_io_mode,
+                            max_concurrent_io_requests, total_cache_size,
                             &our_machine_id, &cluster_metadata,
                             data_directory_lock, result_out);
     }
 }
 
-void run_rethinkdb_proxy(const serve_info_t &serve_info, bool *const result_out) {
+void run_rethinkdb_proxy(serve_info_t *serve_info, bool *const result_out) {
     os_signal_cond_t sigint_cond;
-    guarantee(!serve_info.joins->empty());
+    guarantee(!serve_info->joins.empty());
 
     try {
-        *result_out = serve_proxy(look_up_peers_addresses(*serve_info.joins),
-                                  serve_info.ports,
-                                  serve_info.web_assets,
-                                  &sigint_cond,
-                                  serve_info.config_file);
+        serve_info->look_up_peers();
+        *result_out = serve_proxy(*serve_info,
+                                  &sigint_cond);
     } catch (const host_lookup_exc_t &ex) {
         logERR("%s\n", ex.what());
         *result_out = false;
@@ -845,7 +930,7 @@ options::help_section_t get_machine_options(std::vector<options::option_t> *opti
     options::help_section_t help("Machine name options");
     options_out->push_back(options::option_t(options::names_t("--machine-name", "-n"),
                                              options::OPTIONAL,
-                                             get_random_machine_name()));
+                                             get_machine_name()));
     help.add("-n [ --machine-name ] arg",
              "the name for this machine (as will appear in the metadata).  If not"
              " specified, it will be randomly chosen from a short list of names.");
@@ -875,6 +960,9 @@ options::help_section_t get_file_options(std::vector<options::option_t> *options
     options_out->push_back(options::option_t(options::names_t("--no-direct-io"),
                                              options::OPTIONAL_NO_PARAMETER));
     help.add("--no-direct-io", "disable direct I/O");
+    options_out->push_back(options::option_t(options::names_t("--cache-size"),
+                                             options::OPTIONAL));
+    help.add("--cache-size mb", "total cache size (in megabytes) for the process");
     return help;
 }
 
@@ -895,6 +983,57 @@ std::vector<host_and_port_t> parse_join_options(const std::map<std::string, opti
         joins.push_back(parse_host_and_port(source, "--join", *it, default_port));
     }
     return joins;
+}
+
+std::string get_reql_http_proxy_option(const std::map<std::string, options::values_t> &opts) {
+    std::string source;
+    boost::optional<std::string> proxy = get_optional_option(opts, "--reql-http-proxy", &source);
+    if (!proxy.is_initialized()) {
+        return std::string();
+    }
+
+    // We verify the correct format here, as we won't be configuring libcurl until later,
+    // in the extprocs.  At the moment, we do not support specifying IPv6 addresses.
+    //
+    // protocol = proxy protocol recognized by libcurl: (http, socks4, socks4a, socks5, socks5h)
+    // host = hostname or ip address
+    // port = integer in range [0-65535]
+    // [protocol://]host[:port]
+    //
+    // The chunks in the regex used to parse and verify the format are:
+    //   protocol - (?:([A-z][A-z0-9+-.]*)(?:://))? - captures the protocol, adhering to
+    //     RFC 3986, discarding the '://' from the end
+    //   host - ([A-z0-9.-]+) - captures the hostname or ip address, consisting of letters,
+    //     numbers, dashes, and dots
+    //   port - (?::(\d+))? - captures the numeric port, discarding the preceding ':'
+    RE2 re2_parser("(?:([A-z][A-z0-9+-.]*)(?:://))?([A-z0-9_.-]+)(?::(\\d+))?");
+    std::string protocol, host, port_str;
+    if (!RE2::FullMatch(proxy.get(), re2_parser, &protocol, &host, &port_str)) {
+        throw std::runtime_error(strprintf("--reql-http-proxy format unrecognized, "
+                                           "expected [protocol://]host[:port]: %s",
+                                           proxy.get().c_str()));
+    }
+
+    if (!protocol.empty() &&
+        protocol != "http" &&
+        protocol != "socks4" &&
+        protocol != "socks4a" &&
+        protocol != "socks5" &&
+        protocol != "socks5h") {
+        throw std::runtime_error(strprintf("--reql-http-proxy protocol unrecognized (%s), "
+                                           "must be one of http, socks4, socks4a, socks5, "
+                                           "and socks5h", protocol.c_str()));
+    }
+
+    if (!port_str.empty()) {
+        int port = atoi(port_str.c_str());
+        if (port_str.length() > 5 || port <= 0 || port > MAX_PORT) {
+            throw std::runtime_error(strprintf("--reql-http-proxy port (%s) is not in "
+                                               "the valid range (0-65535)",
+                                               port_str.c_str()));
+        }
+    }
+    return proxy.get();
 }
 
 options::help_section_t get_web_options(std::vector<options::option_t> *options_out) {
@@ -943,6 +1082,10 @@ options::help_section_t get_network_options(const bool join_required, std::vecto
     options_out->push_back(options::option_t(options::names_t("--join", "-j"),
                                              join_required ? options::MANDATORY_REPEAT : options::OPTIONAL_REPEAT));
     help.add("-j [ --join ] host:port", "host and port of a rethinkdb node to connect to");
+
+    options_out->push_back(options::option_t(options::names_t("--reql-http-proxy"),
+                                             options::OPTIONAL));
+    help.add("--reql-http-proxy [protocol://]host[:port]", "HTTP proxy to use for performing `r.http(...)` queries, default port is 1080");
 
     options_out->push_back(options::option_t(options::names_t("--canonical-address"),
                                              options::OPTIONAL_REPEAT));
@@ -1166,14 +1309,12 @@ int main_rethinkdb_create(int argc, char *argv[]) {
 
         options::verify_option_counts(options, opts);
 
-        set_user_group(opts);
-
         base_path_t base_path(get_single_option(opts, "--directory"));
 
         std::string machine_name_str = get_single_option(opts, "--machine-name");
         name_string_t machine_name;
         if (!machine_name.assign_value(machine_name_str)) {
-            fprintf(stderr, "ERROR: machine-name '%s' is invalid.  (%s)", machine_name_str.c_str(), name_string_t::valid_char_msg);
+            fprintf(stderr, "ERROR: machine-name '%s' is invalid.  (%s)\n", machine_name_str.c_str(), name_string_t::valid_char_msg);
             return EXIT_FAILURE;
         }
 
@@ -1191,6 +1332,8 @@ int main_rethinkdb_create(int argc, char *argv[]) {
             fprintf(stderr, "The path '%s' already exists.  Delete it and try again.\n", base_path.path().c_str());
             return EXIT_FAILURE;
         }
+
+        get_and_set_user_group_and_directory(opts, &data_directory_lock);
 
         recreate_temporary_directory(base_path);
 
@@ -1273,15 +1416,15 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
 
         options::verify_option_counts(options, opts);
 
-        set_user_group(opts);
+        get_and_set_user_group(opts);
 
         base_path_t base_path(get_single_option(opts, "--directory"));
 
-        const std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
+        std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
 
         service_address_ports_t address_ports = get_service_address_ports(opts);
 
-        const std::string web_path = get_web_path(opts, argv);
+        std::string web_path = get_web_path(opts, argv);
 
         int num_workers;
         if (!parse_cores_option(opts, &num_workers)) {
@@ -1292,6 +1435,8 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
         if (!parse_io_threads_option(opts, &max_concurrent_io_requests)) {
             return EXIT_FAILURE;
         }
+
+        uint64_t total_cache_size = get_total_cache_size(opts);
 
         // Open and lock the directory, but do not create it
         bool is_new_directory = false;
@@ -1318,16 +1463,21 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
 
         extproc_spawner_t extproc_spawner;
 
-        serve_info_t serve_info(joins, address_ports, web_path,
+        serve_info_t serve_info(std::move(joins),
+                                get_reql_http_proxy_option(opts),
+                                std::move(web_path),
+                                address_ports,
                                 get_optional_option(opts, "--config-file"));
 
         const file_direct_io_mode_t direct_io_mode = parse_direct_io_mode_option(opts);
 
         bool result;
-        run_in_thread_pool(std::bind(&run_rethinkdb_serve, base_path,
-                                     serve_info,
+        run_in_thread_pool(std::bind(&run_rethinkdb_serve,
+                                     base_path,
+                                     &serve_info,
                                      direct_io_mode,
                                      max_concurrent_io_requests,
+                                     total_cache_size,
                                      static_cast<machine_id_t*>(NULL),
                                      static_cast<cluster_semilattice_metadata_t*>(NULL),
                                      &data_directory_lock,
@@ -1360,8 +1510,7 @@ int main_rethinkdb_admin(int argc, char *argv[]) {
 
         options::verify_option_counts(options, opts);
 
-        const std::vector<host_and_port_t> joins =
-            parse_join_options(opts, port_defaults::peer_port);
+        std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
 
         peer_address_t canonical_addresses = get_canonical_addresses(opts, 0);
 
@@ -1401,7 +1550,7 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
 
         options::verify_option_counts(options, opts);
 
-        const std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
+        std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
 
         service_address_ports_t address_ports = get_service_address_ports(opts);
 
@@ -1411,13 +1560,13 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
 
-        set_user_group(opts);
+        get_and_set_user_group(opts);
 
         // Default to putting the log file in the current working directory
         base_path_t base_path(".");
         initialize_logfile(opts, base_path);
 
-        const std::string web_path = get_web_path(opts, argv);
+        std::string web_path = get_web_path(opts, argv);
         const int num_workers = get_cpu_count();
 
         if (check_pid_file(opts) != EXIT_SUCCESS) {
@@ -1435,11 +1584,14 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
 
         extproc_spawner_t extproc_spawner;
 
-        serve_info_t serve_info(joins, address_ports, web_path,
+        serve_info_t serve_info(std::move(joins),
+                                get_reql_http_proxy_option(opts),
+                                std::move(web_path),
+                                address_ports,
                                 get_optional_option(opts, "--config-file"));
 
         bool result;
-        run_in_thread_pool(std::bind(&run_rethinkdb_proxy, serve_info, &result),
+        run_in_thread_pool(std::bind(&run_rethinkdb_proxy, &serve_info, &result),
                            num_workers);
         return result ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const options::named_error_t &ex) {
@@ -1522,22 +1674,20 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
 
         options::verify_option_counts(options, opts);
 
-        set_user_group(opts);
-
         base_path_t base_path(get_single_option(opts, "--directory"));
 
         std::string machine_name_str = get_single_option(opts, "--machine-name");
         name_string_t machine_name;
         if (!machine_name.assign_value(machine_name_str)) {
-            fprintf(stderr, "ERROR: machine-name invalid.  (%s)\n", name_string_t::valid_char_msg);
+            fprintf(stderr, "ERROR: machine-name '%s' is invalid.  (%s)\n", machine_name_str.c_str(), name_string_t::valid_char_msg);
             return EXIT_FAILURE;
         }
 
-        const std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
+        std::vector<host_and_port_t> joins = parse_join_options(opts, port_defaults::peer_port);
 
         const service_address_ports_t address_ports = get_service_address_ports(opts);
 
-        const std::string web_path = get_web_path(opts, argv);
+        std::string web_path = get_web_path(opts, argv);
 
         int num_workers;
         if (!parse_cores_option(opts, &num_workers)) {
@@ -1549,11 +1699,19 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
 
+        uint64_t total_cache_size = get_total_cache_size(opts);
+
         // Attempt to create the directory early so that the log file can use it.
         // If we create the file, it will be cleaned up unless directory_initialized()
         // is called on it.  This will be done after the metadata files have been created.
         bool is_new_directory = false;
         directory_lock_t data_directory_lock(base_path, true, &is_new_directory);
+
+        if (is_new_directory) {
+            get_and_set_user_group_and_directory(opts, &data_directory_lock);
+        } else {
+            get_and_set_user_group(opts);
+        }
 
         recreate_temporary_directory(base_path);
 
@@ -1578,7 +1736,10 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
 
         extproc_spawner_t extproc_spawner;
 
-        serve_info_t serve_info(joins, address_ports, web_path,
+        serve_info_t serve_info(std::move(joins),
+                                get_reql_http_proxy_option(opts),
+                                std::move(web_path),
+                                address_ports,
                                 get_optional_option(opts, "--config-file"));
 
         const file_direct_io_mode_t direct_io_mode = parse_direct_io_mode_option(opts);
@@ -1589,8 +1750,9 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
                                      machine_name,
                                      direct_io_mode,
                                      max_concurrent_io_requests,
+                                     total_cache_size,
                                      is_new_directory,
-                                     serve_info,
+                                     &serve_info,
                                      &data_directory_lock,
                                      &result),
                            num_workers);

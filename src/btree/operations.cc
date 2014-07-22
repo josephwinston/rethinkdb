@@ -3,12 +3,16 @@
 
 #include <stdint.h>
 
-#include "btree/btree_store.hpp"
+#include "btree/erase_range.hpp"
 #include "btree/internal_node.hpp"
 #include "btree/slice.hpp"
 #include "buffer_cache/alt/alt.hpp"
 #include "buffer_cache/alt/blob.hpp"
 #include "containers/archive/vector_stream.hpp"
+#include "containers/binary_blob.hpp"
+#include "rdb_protocol/profile.hpp"
+
+// TODO: consider B#/B* trees to improve space efficiency
 
 real_superblock_t::real_superblock_t(buf_lock_t &&sb_buf)
     : sb_buf_(std::move(sb_buf)) {}
@@ -19,37 +23,49 @@ void real_superblock_t::release() {
 
 block_id_t real_superblock_t::get_root_block_id() {
     buf_read_t read(&sb_buf_);
-    return static_cast<const btree_superblock_t *>(read.get_data_read())->root_block;
+    uint32_t sb_size;
+    const btree_superblock_t *sb_data
+        = static_cast<const btree_superblock_t *>(read.get_data_read(&sb_size));
+    guarantee(sb_size == BTREE_SUPERBLOCK_SIZE);
+    return sb_data->root_block;
 }
 
 void real_superblock_t::set_root_block_id(const block_id_t new_root_block) {
     buf_write_t write(&sb_buf_);
     btree_superblock_t *sb_data
-        = static_cast<btree_superblock_t *>(write.get_data_write());
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
     sb_data->root_block = new_root_block;
 }
 
 block_id_t real_superblock_t::get_stat_block_id() {
     buf_read_t read(&sb_buf_);
-    return static_cast<const btree_superblock_t *>(read.get_data_read())->stat_block;
+    uint32_t sb_size;
+    const btree_superblock_t *sb_data =
+        static_cast<const btree_superblock_t *>(read.get_data_read(&sb_size));
+    guarantee(sb_size == BTREE_SUPERBLOCK_SIZE);
+    return sb_data->stat_block;
 }
 
 void real_superblock_t::set_stat_block_id(const block_id_t new_stat_block) {
     buf_write_t write(&sb_buf_);
     btree_superblock_t *sb_data
-        = static_cast<btree_superblock_t *>(write.get_data_write());
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
     sb_data->stat_block = new_stat_block;
 }
 
 block_id_t real_superblock_t::get_sindex_block_id() {
     buf_read_t read(&sb_buf_);
-    return static_cast<const btree_superblock_t *>(read.get_data_read())->sindex_block;
+    uint32_t sb_size;
+    const btree_superblock_t *sb_data =
+        static_cast<const btree_superblock_t *>(read.get_data_read(&sb_size));
+    guarantee(sb_size == BTREE_SUPERBLOCK_SIZE);
+    return sb_data->sindex_block;
 }
 
 void real_superblock_t::set_sindex_block_id(const block_id_t new_sindex_block) {
     buf_write_t write(&sb_buf_);
     btree_superblock_t *sb_data
-        = static_cast<btree_superblock_t *>(write.get_data_write());
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
     sb_data->sindex_block = new_sindex_block;
 }
 
@@ -125,11 +141,13 @@ bool get_superblock_metainfo(buf_lock_t *superblock,
 
     {
         buf_read_t read(superblock);
+        uint32_t sb_size;
         const btree_superblock_t *data
-            = static_cast<const btree_superblock_t *>(read.get_data_read());
+            = static_cast<const btree_superblock_t *>(read.get_data_read(&sb_size));
+        guarantee(sb_size == BTREE_SUPERBLOCK_SIZE);
 
         // The const cast is okay because we access the data with access_t::read.
-        blob_t blob(superblock->cache()->get_block_size(),
+        blob_t blob(superblock->cache()->max_block_size(),
                     const_cast<char *>(data->metainfo_blob),
                     btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
 
@@ -164,12 +182,14 @@ void get_superblock_metainfo(
     std::vector<char> metainfo;
     {
         buf_read_t read(superblock);
+        uint32_t sb_size;
         const btree_superblock_t *data
-            = static_cast<const btree_superblock_t *>(read.get_data_read());
+            = static_cast<const btree_superblock_t *>(read.get_data_read(&sb_size));
+        guarantee(sb_size == BTREE_SUPERBLOCK_SIZE);
 
         // The const cast is okay because we access the data with access_t::read
         // and don't write to the blob.
-        blob_t blob(superblock->cache()->get_block_size(),
+        blob_t blob(superblock->cache()->max_block_size(),
                     const_cast<char *>(data->metainfo_blob),
                     btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
         blob_acq_t acq;
@@ -195,12 +215,20 @@ void get_superblock_metainfo(
 
 void set_superblock_metainfo(buf_lock_t *superblock,
                              const std::vector<char> &key,
-                             const std::vector<char> &value) {
+                             const binary_blob_t &value) {
+    std::vector<std::vector<char> > keys = {key};
+    std::vector<binary_blob_t> values = {value};
+    set_superblock_metainfo(superblock, keys, values);
+}
+
+void set_superblock_metainfo(buf_lock_t *superblock,
+                             const std::vector<std::vector<char> > &keys,
+                             const std::vector<binary_blob_t> &values) {
     buf_write_t write(superblock);
     btree_superblock_t *data
-        = static_cast<btree_superblock_t *>(write.get_data_write());
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
 
-    blob_t blob(superblock->cache()->get_block_size(),
+    blob_t blob(superblock->cache()->max_block_size(),
                 data->metainfo_blob, btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
 
     std::vector<char> metainfo;
@@ -222,33 +250,48 @@ void set_superblock_metainfo(buf_lock_t *superblock,
 
     blob.clear(buf_parent_t(superblock));
 
-    uint32_t *size;
-    char *verybeg, *info_begin, *info_end;
-    if (find_superblock_metainfo_entry(metainfo.data(), metainfo.data() + metainfo.size(), key, &verybeg, &size, &info_begin, &info_end)) {
-        std::vector<char>::iterator beg = metainfo.begin() + (info_begin - metainfo.data());
-        std::vector<char>::iterator end = metainfo.begin() + (info_end - metainfo.data());
-        // We must modify *size first because resizing the vector invalidates the pointer.
-        rassert(value.size() <= UINT32_MAX);
-        *size = value.size();
+    rassert(keys.size() == values.size());
+    auto value_it = values.begin();
+    for (auto key_it = keys.begin();
+         key_it != keys.end();
+         ++key_it, ++value_it) {
+        uint32_t *size;
+        char *verybeg, *info_begin, *info_end;
+        const bool found_entry =
+            find_superblock_metainfo_entry(metainfo.data(),
+                                           metainfo.data() + metainfo.size(),
+                                           *key_it, &verybeg, &size,
+                                           &info_begin, &info_end);
+        if (found_entry) {
+            std::vector<char>::iterator beg = metainfo.begin() + (info_begin - metainfo.data());
+            std::vector<char>::iterator end = metainfo.begin() + (info_end - metainfo.data());
+            // We must modify *size first because resizing the vector invalidates the pointer.
+            rassert(value_it->size() <= UINT32_MAX);
+            *size = value_it->size();
 
-        std::vector<char>::iterator p = metainfo.erase(beg, end);
+            std::vector<char>::iterator p = metainfo.erase(beg, end);
 
-        metainfo.insert(p, value.begin(), value.end());
-    } else {
-        union {
-            char x[sizeof(uint32_t)];
-            uint32_t y;
-        } u;
-        rassert(key.size() < UINT32_MAX);
-        rassert(value.size() < UINT32_MAX);
+            metainfo.insert(p, static_cast<const uint8_t *>(value_it->data()),
+                            static_cast<const uint8_t *>(value_it->data())
+                                + value_it->size());
+        } else {
+            union {
+                char x[sizeof(uint32_t)];
+                uint32_t y;
+            } u;
+            rassert(key_it->size() < UINT32_MAX);
+            rassert(value_it->size() < UINT32_MAX);
 
-        u.y = key.size();
-        metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
-        metainfo.insert(metainfo.end(), key.begin(), key.end());
+            u.y = key_it->size();
+            metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
+            metainfo.insert(metainfo.end(), key_it->begin(), key_it->end());
 
-        u.y = value.size();
-        metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
-        metainfo.insert(metainfo.end(), value.begin(), value.end());
+            u.y = value_it->size();
+            metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
+            metainfo.insert(metainfo.end(), static_cast<const uint8_t *>(value_it->data()),
+                            static_cast<const uint8_t *>(value_it->data())
+                                + value_it->size());
+        }
     }
 
     blob.append_region(buf_parent_t(superblock), metainfo.size());
@@ -270,9 +313,9 @@ void delete_superblock_metainfo(buf_lock_t *superblock,
                                 const std::vector<char> &key) {
     buf_write_t write(superblock);
     btree_superblock_t *const data
-        = static_cast<btree_superblock_t *>(write.get_data_write());
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
 
-    blob_t blob(superblock->cache()->get_block_size(),
+    blob_t blob(superblock->cache()->max_block_size(),
                 data->metainfo_blob, btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
 
     std::vector<char> metainfo;
@@ -324,8 +367,9 @@ void delete_superblock_metainfo(buf_lock_t *superblock,
 
 void clear_superblock_metainfo(buf_lock_t *superblock) {
     buf_write_t write(superblock);
-    auto data = static_cast<btree_superblock_t *>(write.get_data_write());
-    blob_t blob(superblock->cache()->get_block_size(),
+    auto data
+        = static_cast<btree_superblock_t *>(write.get_data_write(BTREE_SUPERBLOCK_SIZE));
+    blob_t blob(superblock->cache()->max_block_size(),
                 data->metainfo_blob,
                 btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
     blob.clear(buf_parent_t(superblock));
@@ -335,24 +379,20 @@ void insert_root(block_id_t root_id, superblock_t* sb) {
     sb->set_root_block_id(root_id);
 }
 
-void ensure_stat_block(superblock_t *sb) {
-    const block_id_t node_id = sb->get_stat_block_id();
+void create_stat_block(superblock_t *sb) {
+    guarantee(sb->get_stat_block_id() == NULL_BLOCK_ID);
 
-    if (node_id == NULL_BLOCK_ID) {
-        buf_lock_t stats_block(buf_parent_t(sb->expose_buf().txn()),
-                              alt_create_t::create);
-        buf_write_t write(&stats_block);
-        // Make the stat block be the default constructed stats block.
+    buf_lock_t stats_block(buf_parent_t(sb->expose_buf().txn()),
+                          alt_create_t::create);
+    buf_write_t write(&stats_block);
+    // Make the stat block be the default constructed stats block.
 
-        // TODO: This would only initialize the entire stats block if
-        // sizeof(btree_statblock_t) == block_size.value().
-        *static_cast<btree_statblock_t *>(write.get_data_write())
-            = btree_statblock_t();
-        sb->set_stat_block_id(stats_block.block_id());
-    }
+    *static_cast<btree_statblock_t *>(write.get_data_write(BTREE_STATBLOCK_SIZE))
+        = btree_statblock_t();
+    sb->set_stat_block_id(stats_block.block_id());
 }
 
-buf_lock_t get_root(value_sizer_t<void> *sizer, superblock_t *sb) {
+buf_lock_t get_root(value_sizer_t *sizer, superblock_t *sb) {
     const block_id_t node_id = sb->get_root_block_id();
 
     if (node_id != NULL_BLOCK_ID) {
@@ -396,7 +436,7 @@ void detach_all_children(const node_t *node, buf_parent_t parent,
 // split internal nodes proactively).
 // `detacher` is used to detach any values that are removed from `buf`, in
 // case `buf` is a leaf.
-void check_and_handle_split(value_sizer_t<void> *sizer,
+void check_and_handle_split(value_sizer_t *sizer,
                             buf_lock_t *buf,
                             buf_lock_t *last_buf,
                             superblock_t *sb,
@@ -498,7 +538,7 @@ void check_and_handle_split(value_sizer_t<void> *sizer,
 // Merge or level the node if necessary.
 // `detacher` is used to detach any values that are removed from `buf` or its
 // sibling, in case `buf` is a leaf.
-void check_and_handle_underfull(value_sizer_t<void> *sizer,
+void check_and_handle_underfull(value_sizer_t *sizer,
                                 buf_lock_t *buf,
                                 buf_lock_t *last_buf,
                                 superblock_t *sb,
@@ -740,5 +780,283 @@ void get_btree_superblock_and_txn_for_reading(cache_conn_t *cache_conn,
     // KSI: As mentioned, snapshotting here is stupid.
     if (snapshotted == CACHE_SNAPSHOTTED_YES) {
         (*got_superblock_out)->get()->snapshot_subdag();
+    }
+}
+
+/* Passing in a pass_back_superblock parameter will cause this function to
+ * return the superblock after it's no longer needed (rather than releasing
+ * it). Notice the superblock is not guaranteed to be returned until the
+ * keyvalue_location_t that's passed in (keyvalue_location_out) is destroyed.
+ * This is because it may need to use the superblock for some of its methods.
+ * */
+// KSI: It seems like really we should pass the superblock_t via rvalue reference.
+// Is that possible?  (promise_t makes it hard.)
+void find_keyvalue_location_for_write(
+        value_sizer_t *sizer,
+        superblock_t *superblock, const btree_key_t *key,
+        const value_deleter_t *detacher,
+        keyvalue_location_t *keyvalue_location_out,
+        btree_stats_t *stats,
+        profile::trace_t *trace,
+        promise_t<superblock_t *> *pass_back_superblock) {
+    keyvalue_location_out->superblock = superblock;
+    keyvalue_location_out->pass_back_superblock = pass_back_superblock;
+
+    keyvalue_location_out->stat_block = keyvalue_location_out->superblock->get_stat_block_id();
+
+    keyvalue_location_out->stats = stats;
+
+    // KSI: Make sure we do the logic smart here -- don't needlessly hold both
+    // buffers.  (This finds the keyvalue for _write_ so that probably won't really
+    // happen.)
+    buf_lock_t last_buf;
+    buf_lock_t buf;
+    {
+        // KSI: We can't acquire the block for write here -- we could, but it would
+        // worsen the performance of the program -- sometimes we only end up using
+        // this block for read.  So the profiling information is not very good.
+        profile::starter_t starter("Acquiring block for write.\n", trace);
+        buf = get_root(sizer, superblock);
+    }
+
+    // Walk down the tree to the leaf.
+    for (;;) {
+        {
+            buf_read_t read(&buf);
+            if (!node::is_internal(static_cast<const node_t *>(read.get_data_read()))) {
+                break;
+            }
+        }
+        // Check if the node is overfull and proactively split it if it is (since this is an internal node).
+        {
+            profile::starter_t starter("Perhaps split node.", trace);
+            check_and_handle_split(sizer, &buf, &last_buf, superblock, key,
+                                   NULL, detacher);
+        }
+
+        // Check if the node is underfull, and merge/level if it is.
+        {
+            profile::starter_t starter("Perhaps merge nodes.", trace);
+            check_and_handle_underfull(sizer, &buf, &last_buf, superblock, key,
+                                       detacher);
+        }
+
+        // Release the superblock, if we've gone past the root (and haven't
+        // already released it). If we're still at the root or at one of
+        // its direct children, we might still want to replace the root, so
+        // we can't release the superblock yet.
+        if (!last_buf.empty() && keyvalue_location_out->superblock) {
+            if (pass_back_superblock != NULL) {
+                pass_back_superblock->pulse(superblock);
+                keyvalue_location_out->superblock = NULL;
+            } else {
+                keyvalue_location_out->superblock->release();
+                keyvalue_location_out->superblock = NULL;
+            }
+        }
+
+        // Release the old previous node (unless we're at the root), and set
+        // the next previous node (which is the current node).
+        last_buf.reset_buf_lock();
+
+        // Look up and acquire the next node.
+        block_id_t node_id;
+        {
+            buf_read_t read(&buf);
+            auto node = static_cast<const internal_node_t *>(read.get_data_read());
+            node_id = internal_node::lookup(node, key);
+        }
+        rassert(node_id != NULL_BLOCK_ID && node_id != SUPERBLOCK_ID);
+
+        {
+            profile::starter_t starter("Acquiring block for write.\n", trace);
+            buf_lock_t tmp(&buf, node_id, access_t::write);
+            last_buf = std::move(buf);
+            buf = std::move(tmp);
+        }
+    }
+
+    {
+        scoped_malloc_t<void> tmp(sizer->max_possible_size());
+
+        // We've gone down the tree and gotten to a leaf. Now look up the key.
+        buf_read_t read(&buf);
+        auto node = static_cast<const leaf_node_t *>(read.get_data_read());
+        bool key_found = leaf::lookup(sizer, node, key, tmp.get());
+
+        if (key_found) {
+            keyvalue_location_out->there_originally_was_value = true;
+            keyvalue_location_out->value = std::move(tmp);
+        }
+    }
+
+    keyvalue_location_out->last_buf.swap(last_buf);
+    keyvalue_location_out->buf.swap(buf);
+}
+
+void find_keyvalue_location_for_read(
+        value_sizer_t *sizer,
+        superblock_t *superblock, const btree_key_t *key,
+        keyvalue_location_t *keyvalue_location_out,
+        btree_stats_t *stats, profile::trace_t *trace) {
+    stats->pm_keys_read.record();
+    stats->pm_total_keys_read += 1;
+
+    const block_id_t root_id = superblock->get_root_block_id();
+    rassert(root_id != SUPERBLOCK_ID);
+
+    if (root_id == NULL_BLOCK_ID) {
+        // There is no root, so the tree is empty.
+        superblock->release();
+        return;
+    }
+
+    buf_lock_t buf;
+    {
+        profile::starter_t starter("Acquire a block for read.", trace);
+        buf_lock_t tmp(superblock->expose_buf(), root_id, access_t::read);
+        superblock->release();
+        buf = std::move(tmp);
+    }
+
+#ifndef NDEBUG
+    {
+        buf_read_t read(&buf);
+        node::validate(sizer, static_cast<const node_t *>(read.get_data_read()));
+    }
+#endif  // NDEBUG
+
+    for (;;) {
+        block_id_t node_id;
+        {
+            buf_read_t read(&buf);
+            const void *data = read.get_data_read();
+            if (!node::is_internal(static_cast<const node_t *>(data))) {
+                break;
+            }
+
+            node_id = internal_node::lookup(static_cast<const internal_node_t *>(data),
+                                            key);
+        }
+        rassert(node_id != NULL_BLOCK_ID && node_id != SUPERBLOCK_ID);
+
+        {
+            profile::starter_t starter("Acquire a block for read.", trace);
+            buf_lock_t tmp(&buf, node_id, access_t::read);
+            buf.reset_buf_lock();
+            buf = std::move(tmp);
+        }
+
+#ifndef NDEBUG
+        {
+            buf_read_t read(&buf);
+            node::validate(sizer, static_cast<const node_t *>(read.get_data_read()));
+        }
+#endif  // NDEBUG
+    }
+
+    // Got down to the leaf, now probe it.
+    scoped_malloc_t<void> value(sizer->max_possible_size());
+    bool value_found;
+    {
+        buf_read_t read(&buf);
+        const leaf_node_t *leaf
+            = static_cast<const leaf_node_t *>(read.get_data_read());
+        value_found = leaf::lookup(sizer, leaf, key, value.get());
+    }
+    if (value_found) {
+        keyvalue_location_out->buf = std::move(buf);
+        keyvalue_location_out->there_originally_was_value = true;
+        keyvalue_location_out->value = std::move(value);
+    }
+}
+
+void apply_keyvalue_change(
+        value_sizer_t *sizer,
+        keyvalue_location_t *kv_loc,
+        const btree_key_t *key, repli_timestamp_t tstamp,
+        const value_deleter_t *detacher,
+        key_modification_callback_t *km_callback) {
+    key_modification_proof_t km_proof
+        = km_callback->value_modification(kv_loc, key);
+
+    /* how much this keyvalue change affects the total population of the btree
+     * (should be -1, 0 or 1) */
+    int population_change;
+
+    if (kv_loc->value.has()) {
+        // We have a value to insert.
+
+        // Split the node if necessary, to make sure that we have room
+        // for the value.  Not necessary when deleting, because the
+        // node won't grow.
+
+        check_and_handle_split(sizer, &kv_loc->buf, &kv_loc->last_buf,
+                               kv_loc->superblock, key, kv_loc->value.get(),
+                               detacher);
+
+        {
+#ifndef NDEBUG
+            buf_read_t read(&kv_loc->buf);
+            auto leaf_node = static_cast<const leaf_node_t *>(read.get_data_read());
+            rassert(!leaf::is_full(sizer, leaf_node, key, kv_loc->value.get()));
+#endif
+        }
+
+        if (kv_loc->there_originally_was_value) {
+            population_change = 0;
+        } else {
+            population_change = 1;
+        }
+
+        {
+            buf_write_t write(&kv_loc->buf);
+            auto leaf_node = static_cast<leaf_node_t *>(write.get_data_write());
+            leaf::insert(sizer,
+                         leaf_node,
+                         key,
+                         kv_loc->value.get(),
+                         tstamp,
+                         km_proof);
+        }
+
+        kv_loc->stats->pm_keys_set.record();
+        kv_loc->stats->pm_total_keys_set += 1;
+    } else {
+        // Delete the value if it's there.
+        if (kv_loc->there_originally_was_value) {
+            rassert(tstamp != repli_timestamp_t::invalid, "Deletes need a valid timestamp now.");
+            {
+                buf_write_t write(&kv_loc->buf);
+                auto leaf_node = static_cast<leaf_node_t *>(write.get_data_write());
+                leaf::remove(sizer,
+                             leaf_node,
+                             key,
+                             tstamp,
+                             km_proof);
+            }
+            population_change = -1;
+            kv_loc->stats->pm_keys_set.record();
+            kv_loc->stats->pm_total_keys_set += 1;
+        } else {
+            population_change = 0;
+        }
+    }
+
+    // Check to see if the leaf is underfull (following a change in
+    // size or a deletion, and merge/level if it is.
+    check_and_handle_underfull(sizer, &kv_loc->buf, &kv_loc->last_buf,
+                               kv_loc->superblock, key, detacher);
+
+    // Modify the stats block.  The stats block is detached from the rest of the
+    // btree, we don't keep a consistent view of it, so we pass the txn as its
+    // parent.
+    if (kv_loc->stat_block != NULL_BLOCK_ID) {
+        buf_lock_t stat_block(buf_parent_t(kv_loc->buf.txn()),
+                              kv_loc->stat_block, access_t::write);
+        buf_write_t stat_block_write(&stat_block);
+        auto stat_block_buf = static_cast<btree_statblock_t *>(
+                stat_block_write.get_data_write(BTREE_STATBLOCK_SIZE));
+        stat_block_buf->population += population_change;
     }
 }

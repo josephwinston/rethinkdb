@@ -2,11 +2,9 @@
 #ifndef ARCH_IO_DISK_CONFLICT_RESOLVING_HPP_
 #define ARCH_IO_DISK_CONFLICT_RESOLVING_HPP_
 
-#include <map>
 #include <deque>
-
-#include "errors.hpp"
-#include <boost/function.hpp>
+#include <functional>
+#include <map>
 
 #include "arch/io/disk/accounting.hpp"
 #include "arch/runtime/runtime_utils.hpp"
@@ -69,12 +67,12 @@ struct conflict_resolving_diskmgr_t {
     /* Call submit() to send an action to the conflict_resolving_diskmgr_t.
     conflict_resolving_diskmgr_t calls done_fun() when the operation is done. */
     void submit(action_t *action);
-    boost::function<void(action_t *)> done_fun;
+    std::function<void(action_t *)> done_fun;
 
     /* conflict_resolving_diskmgr_t calls submit_fun() to send actions down to the next
     level. The next level should call done() when the operation passed to submit_fun()
     is done. */
-    boost::function<void(accounting_diskmgr_action_t *)> submit_fun;
+    std::function<void(accounting_diskmgr_action_t *)> submit_fun;
     void done(accounting_diskmgr_action_t *payload);
 
 private:
@@ -90,6 +88,9 @@ private:
         *end = ceil_aligned(a->get_offset() + a->get_count(), DEVICE_BLOCK_SIZE) / DEVICE_BLOCK_SIZE;
     }
 
+    /* Does a type cast and calls submit_fun. */
+    void submit_action_downwards(action_t *action);
+
     /* For each chunk B in the file FD: all_chunk_queues[FD][B] contains a deque
     of things that are either (a) waiting to operate on that chunk but cannot
     because something else is currently operating on that chunk, or (b) which
@@ -100,6 +101,12 @@ private:
     properties of multimaps that are not guaranteed by the C++ standard. */
 
     std::map<fd_t, std::map<int64_t, std::deque<action_t *> > > all_chunk_queues;
+
+    /* `resize_waiter_queues` contains actions that are waiting for an ongoing
+    resize to finish. Right now, a resize operation blocks the whole file. */
+    std::map<fd_t, std::deque<action_t *> > resize_waiter_queues;
+    /* Contains an entry > 0 for as long as any resize operation is active. */
+    std::map<fd_t, int> resize_active;
 
     perfmon_sampler_t conflict_sampler;
     perfmon_membership_t conflict_sampler_membership;

@@ -23,6 +23,7 @@ tests:
         cd: "r({'a' => 1, 'b' => 'two', 'c' => true})"
         ot: "{'a' => 1, 'b' => 'two', 'c' => true}"
 
+
     # Nested expressions
     - cd: r.expr({'a':r.expr(1)})
       ot: ({'a':1})
@@ -59,6 +60,16 @@ tests:
     - js: r({'a':{'b':undefined}})
       ot: err("RqlDriverError", "Object field 'b' may not be undefined")
 
+    - js:
+        cd: r.expr({}, "foo")
+        ot: err("RqlDriverError", "Second argument to `r.expr` must be a number or undefined.")
+      py:
+        cd: r.expr({}, "foo")
+        ot: err("RqlDriverError", "Second argument to `r.expr` must be a number.")
+
+    - js: r.expr({}, NaN)
+      ot: err("RqlDriverError", "Second argument to `r.expr` must be a number or undefined.")
+
     # r.object
     - cd: r.object()
       ot: ({})
@@ -70,7 +81,7 @@ tests:
       ot: ({'cd':3})
 
     - cd: r.object('o','d','d')
-      ot: err("RqlCompileError", "OBJECT expects an even number of arguments (but found 3).", [])
+      ot: err("RqlRuntimeError", "OBJECT expects an even number of arguments (but found 3).", [])
 
     - cd: r.object(1, 1)
       ot: err("RqlRuntimeError","Expected type STRING but found NUMBER.",[])

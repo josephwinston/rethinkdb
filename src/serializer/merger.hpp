@@ -7,7 +7,9 @@
 #include <memory>
 
 #include "buffer_cache/types.hpp"
+#include "concurrency/new_mutex.hpp"
 #include "containers/scoped.hpp"
+#include "serializer/buf_ptr.hpp"
 #include "serializer/serializer.hpp"
 
 /*
@@ -47,9 +49,9 @@ public:
     }
 
     // Reading a block from the serializer.  Reads a block, blocks the coroutine.
-    void block_read(const counted_t<standard_block_token_t> &token,
-                    ser_buffer_t *buf, file_account_t *io_account) {
-        inner->block_read(token, buf, io_account);
+    buf_ptr_t block_read(const counted_t<standard_block_token_t> &token,
+                       file_account_t *io_account) {
+        return inner->block_read(token, io_account);
     }
 
     /* The index stores three pieces of information for each ID:
@@ -81,7 +83,8 @@ public:
 
     /* index_write() applies all given index operations in an atomic way */
     /* This is where merger_serializer_t merges operations */
-    void index_write(const std::vector<index_write_op_t> &write_ops,
+    void index_write(new_mutex_in_line_t *mutex_acq,
+                     const std::vector<index_write_op_t> &write_ops,
                      file_account_t *io_account);
 
     // Returns block tokens in the same order as write_infos.
@@ -94,7 +97,7 @@ public:
     }
 
     /* The size, in bytes, of each serializer block */
-    block_size_t max_block_size() const { return inner->max_block_size(); }
+    max_block_size_t max_block_size() const { return inner->max_block_size(); }
 
     /* Return true if no other processes have the file locked */
     bool coop_lock_and_check() { return inner->coop_lock_and_check(); }
@@ -110,6 +113,10 @@ private:
 
     const scoped_ptr_t<serializer_t> inner;
     const scoped_ptr_t<file_account_t> index_writes_io_account;
+
+    // Used to obey the index_write API and make sure we can't possibly make
+    // simultaneous racing index_write calls.
+    new_mutex_t inner_index_write_mutex;
 
     // A map of outstanding index write operations, indexed by block id
     std::map<block_id_t, index_write_op_t> outstanding_index_write_ops;

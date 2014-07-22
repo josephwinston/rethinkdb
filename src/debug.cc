@@ -33,8 +33,7 @@ void debug_print_quoted_string(printf_buffer_t *buf, const uint8_t *s, size_t n)
                 // ASCII dependency here
                 buf->appendf("%c", ch);
             } else {
-                const char *table = "0123456789ABCDEF";
-                buf->appendf("\\x%c%c", table[ch / 16], table[ch % 16]);
+                buf->appendf("\\x%02x", ch);
             }
             break;
         }
@@ -104,3 +103,22 @@ void pb_print(DEBUG_VAR Term *t) {
     debugf("%s\n", t->DebugString().c_str());
 }
 
+debug_timer_t::debug_timer_t(std::string _name)
+    : start(current_microtime()), last(start), name(_name), out("\n") {
+    tick("start");
+}
+debug_timer_t::~debug_timer_t() {
+    tick("end");
+#ifndef NDEBUG
+    debugf("%s", out.c_str());
+#else
+    fprintf(stderr, "%s", out.c_str());
+#endif // NDEBUG
+}
+microtime_t debug_timer_t::tick(const std::string &tag) {
+    microtime_t prev = last;
+    last = current_microtime();
+    out += strprintf("TIMER %s: %15s (%" PRIu64 " %12" PRIu64 " %12" PRIu64 ")\n",
+                     name.c_str(), tag.c_str(), last, last - start, last - prev);
+    return last - start;
+}

@@ -18,16 +18,9 @@ class rdb_namespace_access_t;
 class env_t;
 template <class> class protob_t;
 class scope_env_t;
-class stream_cache2_t;
+class stream_cache_t;
 class term_t;
 class val_t;
-
-class db_t : public single_threaded_countable_t<db_t> {
-public:
-    db_t(uuid_u _id, const std::string &_name) : id(_id), name(_name) { }
-    const uuid_u id;
-    const std::string name;
-};
 
 class table_t : public single_threaded_countable_t<table_t>, public pb_rcheckable_t {
 public:
@@ -64,7 +57,7 @@ public:
     counted_t<const datum_t> batched_insert(
         env_t *env,
         std::vector<counted_t<const datum_t> > &&insert_datums,
-        bool upsert,
+        conflict_behavior_t conflict_behavior,
         durability_requirement_t durability_requirement,
         bool return_vals);
 
@@ -79,7 +72,11 @@ public:
 
     counted_t<const db_t> db;
     const std::string name;
+    std::string display_name() {
+        return db->name + "." + name;
+    }
 
+    uuid_u get_uuid() const { return uuid; }
 private:
     friend class distinct_term_t;
 
@@ -91,7 +88,7 @@ private:
         env_t *env,
         const std::vector<store_key_t> &keys,
         const std::vector<counted_t<const datum_t> > &insert_datums,
-        bool upsert,
+        conflict_behavior_t conflict_behavior,
         durability_requirement_t durability_requirement);
 
     MUST_USE bool sync_depending_on_durability(
@@ -105,6 +102,9 @@ private:
 
     datum_range_t bounds;
     sorting_t sorting;
+
+    // The uuid of the table in the metadata.
+    uuid_u uuid;
 };
 
 
@@ -112,7 +112,8 @@ enum function_shortcut_t {
     NO_SHORTCUT = 0,
     CONSTANT_SHORTCUT = 1,
     GET_FIELD_SHORTCUT = 2,
-    PLUCK_SHORTCUT = 3
+    PLUCK_SHORTCUT = 3,
+    PAGE_SHORTCUT = 4
 };
 
 // A value is anything RQL can pass around -- a datum, a sequence, a function, a
@@ -125,7 +126,7 @@ public:
     class type_t {
         friend class val_t;
         friend void run(Query *q, scoped_ptr_t<env_t> *env_ptr,
-                        Response *res, stream_cache2_t *stream_cache2,
+                        Response *res, stream_cache_t *stream_cache,
                         bool *response_needed_out);
     public:
         enum raw_type_t {
@@ -173,9 +174,9 @@ public:
 
     counted_t<const db_t> as_db() const;
     counted_t<table_t> as_table();
-    std::pair<counted_t<table_t> , counted_t<datum_stream_t> > as_selection(env_t *env);
+    std::pair<counted_t<table_t>, counted_t<datum_stream_t> > as_selection(env_t *env);
     counted_t<datum_stream_t> as_seq(env_t *env);
-    std::pair<counted_t<table_t> , counted_t<const datum_t> > as_single_selection();
+    std::pair<counted_t<table_t>, counted_t<const datum_t> > as_single_selection();
     // See func.hpp for an explanation of shortcut functions.
     counted_t<func_t> as_func(function_shortcut_t shortcut = NO_SHORTCUT);
 

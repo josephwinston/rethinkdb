@@ -7,6 +7,7 @@
 
 #include "containers/archive/archive.hpp"
 #include "containers/archive/vector_stream.hpp"
+#include "containers/archive/versioned.hpp"
 #include "concurrency/pmap.hpp"
 #include "logger.hpp"
 
@@ -59,23 +60,28 @@ public:
         dest_thread(_dest_thread), dest_mailbox_id(_dest_mailbox_id), subwriter(_subwriter) { }
     virtual ~raw_mailbox_writer_t() { }
 
-    void write(write_stream_t *stream) {
-        write_message_t msg;
-        msg << dest_thread;
-        msg << dest_mailbox_id;
-        uint64_t prefix_length = static_cast<uint64_t>(msg.size());
+    void write(cluster_version_t cluster_version, write_stream_t *stream) {
+        write_message_t wm;
+        // Right now, we serialize this length/thread/mailbox information the same
+        // way irrespective of version. (Serialization methods for primitive types
+        // all behave the same way anyway -- this is just for performance, avoiding
+        // unnecessary branching on cluster_version.)  See read_mailbox_header for
+        // the deserialization.
+        serialize_universal(&wm, dest_thread);
+        serialize_universal(&wm, dest_mailbox_id);
+        uint64_t prefix_length = static_cast<uint64_t>(wm.size());
 
-        subwriter->write(&msg);
+        subwriter->write(cluster_version, &wm);
 
-        // Prepend the message length
+        // Prepend the message length.
         // TODO: It would be more efficient if we could make this part of `msg`.
         //  e.g. with a `prepend()` method on write_message_t.
         write_message_t length_msg;
-        length_msg << (static_cast<uint64_t>(msg.size()) - prefix_length);
+        serialize_universal(&length_msg, static_cast<uint64_t>(wm.size()) - prefix_length);
 
         int res = send_write_message(stream, &length_msg);
         if (res) { throw fake_archive_exc_t(); }
-        res = send_write_message(stream, &msg);
+        res = send_write_message(stream, &wm);
         if (res) { throw fake_archive_exc_t(); }
     }
 private:
@@ -112,68 +118,105 @@ raw_mailbox_t *mailbox_manager_t::mailbox_table_t::find_mailbox(raw_mailbox_t::i
     }
 }
 
-void mailbox_manager_t::on_message(peer_id_t source_peer, read_stream_t *stream) {
+// This type merely reduces the amount of pointers we have to pass to read_mailbox_header().
+struct mailbox_header_t {
+    uint64_t data_length;
     int32_t dest_thread;
-    uint64_t data_length = 0;
     raw_mailbox_t::id_t dest_mailbox_id;
-    {
-        archive_result_t res = deserialize(stream, &data_length);
-        if (res != archive_result_t::SUCCESS
-            || data_length > std::numeric_limits<size_t>::max()
-            || data_length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-            throw fake_archive_exc_t();
-        }
+};
 
-        res = deserialize(stream, &dest_thread);
-        if (bad(res)) { throw fake_archive_exc_t(); }
-        res = deserialize(stream, &dest_mailbox_id);
-        if (bad(res)) { throw fake_archive_exc_t(); }
+// Helper function for on_local_message and on_message
+void read_mailbox_header(read_stream_t *stream,
+                         mailbox_header_t *header_out) {
+    // See raw_mailbox_writer_t::write for the serialization.
+    uint64_t data_length;
+    archive_result_t res = deserialize_universal(stream, &data_length);
+    if (res != archive_result_t::SUCCESS
+        || data_length > std::numeric_limits<size_t>::max()
+        || data_length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw fake_archive_exc_t();
+    }
+    header_out->data_length = data_length;
+    res = deserialize_universal(stream, &header_out->dest_thread);
+    if (bad(res)) { throw fake_archive_exc_t(); }
+    res = deserialize_universal(stream, &header_out->dest_mailbox_id);
+    if (bad(res)) { throw fake_archive_exc_t(); }
+}
+
+void mailbox_manager_t::on_local_message(peer_id_t source_peer,
+                                         cluster_version_t cluster_version,
+                                         std::vector<char> &&data) {
+    // This is only sensible:
+    rassert(cluster_version == cluster_version_t::CLUSTER);
+
+    vector_read_stream_t stream(std::move(data));
+
+    mailbox_header_t mbox_header;
+    read_mailbox_header(&stream, &mbox_header);
+    if (mbox_header.dest_thread == raw_mailbox_t::address_t::ANY_THREAD) {
+        // TODO: this will just run the callback on the current thread, maybe do
+        // some load balancing, instead
+        mbox_header.dest_thread = get_thread_id().threadnum;
     }
 
-    // Read the data from the read stream, so it can be deallocated before we continue
-    // in a coroutine
     std::vector<char> stream_data;
     int64_t stream_data_offset = 0;
-    // Special case for `vector_read_stream_t`s to avoid copying.
-    // `connectivity_cluster_t` gives us a `vector_read_stream_t` if the message is
-    // delivered locally.
-    vector_read_stream_t *vector_stream = dynamic_cast<vector_read_stream_t *>(stream);
-    if (vector_stream != NULL) {
-        // Avoid copying the data
-        vector_stream->swap(&stream_data, &stream_data_offset);
-        if(stream_data.size() - static_cast<uint64_t>(stream_data_offset) != data_length) {
-            // Either we go a vector_read_stream_t that contained more data
-            // than just ours (which shouldn't happen), or we got a wrong data_length
-            // from the network.
-            throw fake_archive_exc_t();
-        }
-    } else {
-        stream_data.resize(data_length);
-        int64_t bytes_read = force_read(stream, stream_data.data(), data_length);
-        if (bytes_read != static_cast<int64_t>(data_length)) {
-            throw fake_archive_exc_t();
-        }
-    }
 
-    if (dest_thread == raw_mailbox_t::address_t::ANY_THREAD) {
-        // TODO: this will just run the callback on the current thread, maybe do some load balancing, instead
-        dest_thread = get_thread_id().threadnum;
+    stream.swap(&stream_data, &stream_data_offset);
+    if (stream_data.size() - static_cast<uint64_t>(stream_data_offset) != mbox_header.data_length) {
+        // Either we got a vector_read_stream_t that contained more data
+        // than just ours (which shouldn't happen), or we got a wrong data_length
+        // from the network.
+        throw fake_archive_exc_t();
     }
 
     // We use `spawn_now_dangerously()` to avoid having to heap-allocate `stream_data`.
     // Instead we pass in a pointer to our local automatically allocated object
     // and `mailbox_read_coroutine()` moves the data out of it before it yields.
     coro_t::spawn_now_dangerously(std::bind(&mailbox_manager_t::mailbox_read_coroutine,
-                                            this, source_peer, threadnum_t(dest_thread),
-                                            dest_mailbox_id, &stream_data,
-                                            stream_data_offset));
+                                            this, source_peer,
+                                            cluster_version,
+                                            threadnum_t(mbox_header.dest_thread),
+                                            mbox_header.dest_mailbox_id,
+                                            &stream_data, stream_data_offset,
+                                            FORCE_YIELD));
+}
+
+void mailbox_manager_t::on_message(peer_id_t source_peer,
+                                   cluster_version_t cluster_version,
+                                   read_stream_t *stream) {
+    mailbox_header_t mbox_header;
+    read_mailbox_header(stream, &mbox_header);
+    if (mbox_header.dest_thread == raw_mailbox_t::address_t::ANY_THREAD) {
+        mbox_header.dest_thread = get_thread_id().threadnum;
+    }
+
+    // Read the data from the read stream, so it can be deallocated before we continue
+    // in a coroutine
+    std::vector<char> stream_data;
+    stream_data.resize(mbox_header.data_length);
+    int64_t bytes_read = force_read(stream, stream_data.data(), mbox_header.data_length);
+    if (bytes_read != static_cast<int64_t>(mbox_header.data_length)) {
+        throw fake_archive_exc_t();
+    }
+
+    // We use `spawn_now_dangerously()` to avoid having to heap-allocate `stream_data`.
+    // Instead we pass in a pointer to our local automatically allocated object
+    // and `mailbox_read_coroutine()` moves the data out of it before it yields.
+    coro_t::spawn_now_dangerously(std::bind(&mailbox_manager_t::mailbox_read_coroutine,
+                                            this, source_peer, cluster_version,
+                                            threadnum_t(mbox_header.dest_thread),
+                                            mbox_header.dest_mailbox_id,
+                                            &stream_data, 0, MAYBE_YIELD));
 }
 
 void mailbox_manager_t::mailbox_read_coroutine(peer_id_t source_peer,
+                                               cluster_version_t cluster_version,
                                                threadnum_t dest_thread,
                                                raw_mailbox_t::id_t dest_mailbox_id,
                                                std::vector<char> *stream_data,
-                                               int64_t stream_data_offset) {
+                                               int64_t stream_data_offset,
+                                               force_yield_t force_yield) {
 
     // Construct a new stream to use
     vector_read_stream_t stream(std::move(*stream_data), stream_data_offset);
@@ -183,11 +226,16 @@ void mailbox_manager_t::mailbox_read_coroutine(peer_id_t source_peer,
     bool archive_exception = false;
     {
         on_thread_t rethreader(dest_thread);
+        if (force_yield == FORCE_YIELD && rethreader.home_thread() == get_thread_id()) {
+            // Yield to avoid problems with reentrancy in case of local
+            // delivery.
+            coro_t::yield();
+        }
 
         try {
             raw_mailbox_t *mbox = mailbox_tables.get()->find_mailbox(dest_mailbox_id);
             if (mbox != NULL) {
-                mbox->callback->read(&stream);
+                mbox->callback->read(cluster_version, &stream);
             }
         } catch (const fake_archive_exc_t &e) {
             // Set a flag and handle the exception later.

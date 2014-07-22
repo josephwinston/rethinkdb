@@ -100,6 +100,37 @@ Query: #{PP.pp(query, "")}\nBatch Conf: #{bc}
     }
   end
 
+  def test_malformed_queries
+    class << $c
+      def dispatch(msg, token)
+        payload = RethinkDB::Shim.dump_json(msg).force_encoding('BINARY')
+        payload = $dispatch_hook.call(payload) if $dispatch_hook
+        prefix = [token, payload.bytesize].pack('Q<L<')
+        send(prefix + payload)
+        return token
+      end
+    end
+
+    begin
+      assert_raise(RethinkDB::RqlDriverError) {
+        $dispatch_hook = lambda {|x| x.gsub('[', '{')}
+        eq(r(1), 1)
+      }
+      assert_raise(RethinkDB::RqlDriverError) {
+        $dispatch_hook = lambda {|x| x.gsub('1', '\u0000')}
+        eq(r(1), 1)
+      }
+    ensure
+      $dispatch_hook = nil
+    end
+    assert_equal({'t' => 16, 'b' => [], 'r' => ["Client is buggy (failed to deserialize query)."]},
+                 $c.wait($c.dispatch([1, 1337, 1, {}], 1337)))
+    assert_equal({ "t"=>16, "b"=>[], "r"=>["Client is buggy (failed to deserialize query)."] },
+                 $c.wait($c.dispatch(["a", 1337, 1, {}], -1)))
+    assert_equal({ "t"=>16, "b"=>[], "r"=>["Client is buggy (failed to deserialize query)."] },
+                 $c.wait($c.dispatch([1, 1337, 1, 1], 16)))
+  end
+
   def test_gmr_slow
     if $slow
       eq(r([]).group('a').count, {})

@@ -118,8 +118,10 @@ private:
         case Term::MAKE_OBJ:
         case Term::VAR:
         case Term::JAVASCRIPT:
+        case Term::HTTP:
         case Term::ERROR:
         case Term::IMPLICIT_VAR:
+        case Term::RANDOM:
         case Term::DB:
         case Term::TABLE:
         case Term::GET:
@@ -152,6 +154,7 @@ private:
         case Term::MERGE:
         case Term::LITERAL:
         case Term::BETWEEN:
+        case Term::CHANGES:
         case Term::REDUCE:
         case Term::MAP:
         case Term::FILTER:
@@ -166,6 +169,8 @@ private:
         case Term::MAX:
         case Term::UNION:
         case Term::NTH:
+        case Term::ARGS:
+        case Term::BINARY:
         case Term::LIMIT:
         case Term::SKIP:
         case Term::INNER_JOIN:
@@ -287,8 +292,10 @@ private:
         case Term::MAKE_OBJ:
         case Term::VAR:
         case Term::JAVASCRIPT:
+        case Term::HTTP:
         case Term::ERROR:
         case Term::IMPLICIT_VAR:
+        case Term::RANDOM:
         case Term::DB:
         case Term::TABLE:
         case Term::GET:
@@ -319,8 +326,11 @@ private:
         case Term::PLUCK:
         case Term::WITHOUT:
         case Term::MERGE:
+        case Term::ARGS:
+        case Term::BINARY:
         case Term::LITERAL:
         case Term::BETWEEN:
+        case Term::CHANGES:
         case Term::ORDERBY:
         case Term::DISTINCT:
         case Term::UNION:

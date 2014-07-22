@@ -1,4 +1,3 @@
-from . import ql2_pb2 as p
 import types
 import sys
 import datetime
@@ -8,8 +7,12 @@ import time
 import re
 import json as py_json
 from threading import Lock
+
 from .errors import *
 from . import repl # For the repl connection
+from . import ql2_pb2 as p
+
+pTerm = p.Term.TermType
 
 # This is both an external function and one used extensively
 # internally to convert coerce python values to RQL types
@@ -20,8 +23,23 @@ def expr(val, nesting_depth=20):
     if nesting_depth <= 0:
         raise RqlDriverError("Nesting depth limit exceeded")
 
+    if not isinstance(nesting_depth, int):
+        raise RqlDriverError("Second argument to `r.expr` must be a number.")
+
     if isinstance(val, RqlQuery):
         return val
+    elif isinstance(val, list):
+        val = [expr(v, nesting_depth - 1) for v in val]
+        return MakeArray(*val)
+    elif isinstance(val, dict):
+        # MakeObj doesn't take the dict as a keyword args to avoid
+        # conflicting with the `self` parameter.
+        obj = {}
+        for (k,v) in val.iteritems():
+            obj[k] = expr(v, nesting_depth - 1)
+        return MakeObj(obj)
+    elif isinstance(val, collections.Callable):
+        return Func(val)
     elif isinstance(val, datetime.datetime) or isinstance(val, datetime.date):
         if not hasattr(val, 'tzinfo') or not val.tzinfo:
             raise RqlDriverError("""Cannot convert %s to ReQL time object
@@ -31,59 +49,8 @@ def expr(val, nesting_depth=20):
             use one of ReQL's bultin time constructors, r.now, r.time, or r.iso8601.
             """ % (type(val).__name__))
         return ISO8601(val.isoformat())
-    elif isinstance(val, list):
-        val = [expr(v, nesting_depth - 1) for v in val]
-        return MakeArray(*val)
-    elif isinstance(val, dict):
-        # MakeObj doesn't take the dict as a keyword args to avoid
-        # conflicting with the `self` parameter.
-        obj = {}
-        for k in val.keys():
-            obj[k] = expr(val[k], nesting_depth - 1)
-        return MakeObj(obj)
-    elif isinstance(val, collections.Callable):
-        return Func(val)
     else:
         return Datum(val)
-
-# Like expr but attempts to serialize as much of the value as JSON
-# as possible.
-def exprJSON(val, nesting_depth=20):
-    if nesting_depth <= 0:
-        raise RqlDriverError("Nesting depth limit exceeded")
-
-    if isinstance(val, RqlQuery):
-        return val
-    elif isJSON(val, nesting_depth):
-        return Json(py_json.dumps(val))
-    elif isinstance(val, dict):
-        copy = val.copy()
-        for k,v in copy.items():
-            copy[k] = exprJSON(v, nesting_depth)
-        return MakeObj(copy)
-    elif isinstance(val, list):
-        copy = []
-        for v in val:
-            copy.append(exprJSON(v, nesting_depth))
-        return MakeArray(*copy)
-    else:
-        # Default to datum serialization
-        return expr(val, nesting_depth - 1)
-
-def isJSON(val, nesting_depth=20):
-    if nesting_depth <= 0:
-        raise RqlDriverError("Nesting depth limit exceeded")
-
-    if isinstance(val, RqlQuery):
-        return False
-    elif isinstance(val, dict):
-        return all([isinstance(k, types.StringTypes) and isJSON(v, nesting_depth - 1) for k,v in val.items()])
-    elif isinstance(val, list):
-        return all([isJSON(v, nesting_depth - 1) for v in val])
-    elif isinstance(val, (int, float, str, unicode, bool)):
-        return True
-    else:
-        return False
 
 class RqlQuery(object):
 
@@ -92,20 +59,20 @@ class RqlQuery(object):
         self.args = [expr(e) for e in args]
 
         self.optargs = {}
-        for k in optargs.keys():
-            if not isinstance(optargs[k], RqlQuery) and optargs[k] == ():
+        for (k,v) in optargs.iteritems():
+            if not isinstance(v, RqlQuery) and v == ():
                 continue
-            self.optargs[k] = expr(optargs[k])
+            self.optargs[k] = expr(v)
 
     # Send this query to the server to be executed
-    def run(self, c=None, **global_opt_args):
+    def run(self, c=None, **global_optargs):
         if not c:
             if repl.default_connection:
                 c = repl.default_connection
             else:
                 raise RqlDriverError("RqlQuery.run must be given a connection to run on.")
 
-        return c._start(self, **global_opt_args)
+        return c._start(self, **global_optargs)
 
     def __str__(self):
         qp = QueryPrinter(self)
@@ -114,17 +81,12 @@ class RqlQuery(object):
     def __repr__(self):
         return "<RqlQuery instance: %s >" % str(self)
 
-    # Compile this query to a binary protobuf buffer
-    def build(self, term):
-        term.type = self.tt
-
-        for arg in self.args:
-            arg.build(term.args.add())
-
-        for k in self.optargs.keys():
-            pair = term.optargs.add()
-            pair.key = k
-            self.optargs[k].build(pair.val)
+    # Compile this query to a json-serializable object
+    def build(self):
+        res = [self.tt, [arg.build() for arg in self.args]]
+        if len(self.optargs) > 0:
+            res.append(dict((k, v.build()) for (k,v) in self.optargs.iteritems()))
+        return res
 
     # The following are all operators and methods that operate on
     # Rql queries to build up more complex operations
@@ -183,131 +145,148 @@ class RqlQuery(object):
         return Mod(other, self)
 
     def __and__(self, other):
-        return All(self, other, infix=True)
+        query = All(self, other)
+        query.set_infix()
+        return query
 
     def __rand__(self, other):
-        return All(other, self, infix=True)
+        query = All(other, self)
+        query.set_infix()
+        return query
 
     def __or__(self, other):
-        return Any(self, other, infix=True)
+        query = Any(self, other)
+        query.set_infix()
+        return query
 
     def __ror__(self, other):
-        return Any(other, self, infix=True)
+        query = Any(other, self)
+        query.set_infix()
+        return query
 
     # Non-operator versions of the above
 
-    def eq(*args):
-        return Eq(*args)
+    def eq(self, *args):
+        return Eq(self, *args)
 
-    def ne(*args):
-        return Ne(*args)
+    def ne(self, *args):
+        return Ne(self, *args)
 
-    def lt(*args):
-        return Lt(*args)
+    def lt(self, *args):
+        return Lt(self, *args)
 
-    def le(*args):
-        return Le(*args)
+    def le(self, *args):
+        return Le(self, *args)
 
-    def gt(*args):
-        return Gt(*args)
+    def gt(self, *args):
+        return Gt(self, *args)
 
-    def ge(*args):
-        return Ge(*args)
+    def ge(self, *args):
+        return Ge(self, *args)
 
-    def add(*args):
-        return Add(*args)
+    def add(self, *args):
+        return Add(self, *args)
 
-    def sub(*args):
-        return Sub(*args)
+    def sub(self, *args):
+        return Sub(self, *args)
 
-    def mul(*args):
-        return Mul(*args)
+    def mul(self, *args):
+        return Mul(self, *args)
 
-    def div(*args):
-        return Div(*args)
+    def div(self, *args):
+        return Div(self, *args)
 
-    def mod(self, other):
-        return Mod(self, other)
+    def mod(self, *args):
+        return Mod(self, *args)
 
-    def and_(*args):
-        return All(*args)
+    def and_(self, *args):
+        return All(self, *args)
 
-    def or_(*args):
-        return Any(*args)
+    def or_(self, *args):
+        return Any(self, *args)
 
-    def not_(self):
-        return Not(self)
+    def not_(self, *args):
+        return Not(self, *args)
 
     # N.B. Cannot use 'in' operator because it must return a boolean
-    def contains(self, *attr):
-        return Contains(self, *map(func_wrap, attr))
+    def contains(self, *args):
+        return Contains(self, *[func_wrap(arg) for arg in args])
 
-    def has_fields(self, *attr):
-        return HasFields(self, *attr)
+    def has_fields(self, *args):
+        return HasFields(self, *args)
 
-    def with_fields(self, *attr):
-        return WithFields(self, *attr)
+    def with_fields(self, *args):
+        return WithFields(self, *args)
 
-    def keys(self):
-        return Keys(self)
+    def keys(self, *args):
+        return Keys(self, *args)
+
+    def changes(self, *args):
+        return Changes(self, *args)
 
     # Polymorphic object/sequence operations
-    def pluck(self, *attrs):
-        return Pluck(self, *attrs)
+    def pluck(self, *args):
+        return Pluck(self, *args)
 
-    def without(self, *attrs):
-        return Without(self, *attrs)
+    def without(self, *args):
+        return Without(self, *args)
 
-    def do(self, func):
-        return FunCall(func_wrap(func), self)
+    def do(self, *args):
+        return FunCall(self, *args)
 
-    def default(self, handler):
-        return Default(self, handler)
+    def default(self, *args):
+        return Default(self, *args)
 
-    def update(self, func, non_atomic=(), durability=(), return_vals=()):
-        return Update(self, func_wrap(func), non_atomic=non_atomic,
-                      durability=durability, return_vals=return_vals)
+    def update(self, *args, **kwargs):
+        kwargs.setdefault('non_atomic', ())
+        kwargs.setdefault('durability', ())
+        kwargs.setdefault('return_vals', ())
+        return Update(self, *[func_wrap(arg) for arg in args], **kwargs)
 
-    def replace(self, func, non_atomic=(), durability=(), return_vals=()):
-        return Replace(self, func_wrap(func), non_atomic=non_atomic,
-                       durability=durability, return_vals=return_vals)
+    def replace(self, *args, **kwargs):
+        kwargs.setdefault('non_atomic', ())
+        kwargs.setdefault('durability', ())
+        kwargs.setdefault('return_vals', ())
+        return Replace(self, *[func_wrap(arg) for arg in args], **kwargs)
 
-    def delete(self, durability=(), return_vals=()):
-        return Delete(self, durability=durability, return_vals=return_vals)
+    def delete(self, *args, **kwargs):
+        kwargs.setdefault('durability', ())
+        kwargs.setdefault('return_vals', ())
+        return Delete(self, *args, **kwargs)
 
     # Rql type inspection
-    def coerce_to(self, other_type):
-        return CoerceTo(self, other_type)
+    def coerce_to(self, *args):
+        return CoerceTo(self, *args)
 
-    def ungroup(self):
-        return Ungroup(self)
+    def ungroup(self, *args):
+        return Ungroup(self, *args)
 
-    def type_of(self):
-        return TypeOf(self)
+    def type_of(self, *args):
+        return TypeOf(self, *args)
 
-    def merge(self, *others):
-        return Merge(self, *map(func_wrap, others))
+    def merge(self, *args):
+        return Merge(self, *[func_wrap(arg) for arg in args])
 
-    def append(self, val):
-        return Append(self, val)
+    def append(self, *args):
+        return Append(self, *args)
 
-    def prepend(self, val):
-        return Prepend(self, val)
+    def prepend(self, *args):
+        return Prepend(self, *args)
 
-    def difference(self, val):
-        return Difference(self, val)
+    def difference(self, *args):
+        return Difference(self, *args)
 
-    def set_insert(self, val):
-        return SetInsert(self, val)
+    def set_insert(self, *args):
+        return SetInsert(self, *args)
 
-    def set_union(self, val):
-        return SetUnion(self, val)
+    def set_union(self, *args):
+        return SetUnion(self, *args)
 
-    def set_intersection(self, val):
-        return SetIntersection(self, val)
+    def set_intersection(self, *args):
+        return SetIntersection(self, *args)
 
-    def set_difference(self, val):
-        return SetDifference(self, val)
+    def set_difference(self, *args):
+        return SetDifference(self, *args)
 
     # Operator used for get attr / nth / slice. Non-operator versions below
     # in cases of ambiguity
@@ -331,47 +310,47 @@ class RqlQuery(object):
                 "bracket operator called with an unsupported parameter type: %s.%s" %
                 (index.__class__.__module__, index.__class__.__name__))
 
-    def __iter__(self):
+    def __iter__(*args, **kwargs):
         raise RqlDriverError(
                 "__iter__ called on an RqlQuery object.\n"+
                 "To iterate over the results of a query, call run first.\n"+
                 "To iterate inside a query, use map or for_each.")
 
-    def get_field(self, index):
-        return GetField(self, index)
+    def get_field(self, *args):
+        return GetField(self, *args)
 
-    def nth(self, index):
-        return Nth(self, index)
+    def nth(self, *args):
+        return Nth(self, *args)
 
-    def match(self, pattern):
-        return Match(self, pattern)
+    def match(self, *args):
+        return Match(self, *args)
 
     def split(self, *args):
         return Split(self, *args)
 
-    def upcase(self):
-        return Upcase(self)
+    def upcase(self, *args):
+        return Upcase(self, *args)
 
-    def downcase(self):
-        return Downcase(self)
+    def downcase(self, *args):
+        return Downcase(self, *args)
 
-    def is_empty(self):
-        return IsEmpty(self)
+    def is_empty(self, *args):
+        return IsEmpty(self, *args)
 
-    def indexes_of(self, val):
-        return IndexesOf(self,func_wrap(val))
+    def indexes_of(self, *args):
+        return IndexesOf(self, *[func_wrap(arg) for arg in args])
 
-    def slice(self, left, right, left_bound=(), right_bound=()):
-        return Slice(self, left, right, left_bound=left_bound, right_bound=right_bound)
+    def slice(self, *args, **kwargs):
+        return Slice(self, *args, **kwargs)
 
-    def skip(self, index):
-        return Skip(self, index)
+    def skip(self, *args):
+        return Skip(self, *args)
 
-    def limit(self, index):
-        return Limit(self, index)
+    def limit(self, *args):
+        return Limit(self, *args)
 
-    def reduce(self, func):
-        return Reduce(self, func_wrap(func))
+    def reduce(self, *args):
+        return Reduce(self, *[func_wrap(arg) for arg in args])
 
     def sum(self, *args):
         return Sum(self, *[func_wrap(arg) for arg in args])
@@ -385,119 +364,123 @@ class RqlQuery(object):
     def max(self, *args):
         return Max(self, *[func_wrap(arg) for arg in args])
 
-    def map(self, func):
-        return Map(self, func_wrap(func))
+    def map(self, *args):
+        return Map(self, *[func_wrap(arg) for arg in args])
 
-    def filter(self, func, default=()):
-        return Filter(self, func_wrap(func), default=default)
+    def filter(self, *args, **kwargs):
+        kwargs.setdefault('default', ())
+        return Filter(self, *[func_wrap(arg) for arg in args], **kwargs)
 
-    def concat_map(self, func):
-        return ConcatMap(self, func_wrap(func))
+    def concat_map(self, *args):
+        return ConcatMap(self, *[func_wrap(arg) for arg in args])
 
-    def order_by(self, *obs, **kwargs):
-        obs = [ob if isinstance(ob, Asc) or isinstance(ob, Desc) else func_wrap(ob) for ob in obs]
-        return OrderBy(self, *obs, **kwargs)
+    def order_by(self, *args, **kwargs):
+        args = [arg if isinstance(arg, Asc) or isinstance(arg, Desc) else func_wrap(arg) for arg in args]
+        return OrderBy(self, *args, **kwargs)
 
-    def between(self, left=None, right=None, left_bound=(), right_bound=(), index=()):
-        return Between(self, left, right, left_bound=left_bound, right_bound=right_bound, index=index)
+    def between(self, *args, **kwargs):
+        kwargs.setdefault('left_bound', ())
+        kwargs.setdefault('right_bound', ())
+        kwargs.setdefault('index', ())
+        return Between(self, *args, **kwargs)
 
-    def distinct(self):
-        return Distinct(self)
+    def distinct(self, *args, **kwargs):
+        return Distinct(self, *args, **kwargs)
 
     # NB: Can't overload __len__ because Python doesn't
     #     allow us to return a non-integer
-    def count(self, filter=()):
-        if filter is ():
-            return Count(self)
-        else:
-            return Count(self, func_wrap(filter))
+    def count(self, *args):
+        return Count(self, *[func_wrap(arg) for arg in args])
 
-    def union(self, *others):
-        return Union(self, *others)
+    def union(self, *args):
+        return Union(self, *args)
 
-    def inner_join(self, other, predicate):
-        return InnerJoin(self, other, predicate)
+    def inner_join(self, *args):
+        return InnerJoin(self, *args)
 
-    def outer_join(self, other, predicate):
-        return OuterJoin(self, other, predicate)
+    def outer_join(self, *args):
+        return OuterJoin(self, *args)
 
-    def eq_join(self, left_attr, other, index=()):
-        return EqJoin(self, func_wrap(left_attr), other, index=index)
+    def eq_join(self, *args, **kwargs):
+        kwargs.setdefault('index', ())
+        return EqJoin(self, *[func_wrap(arg) for arg in args], **kwargs)
 
-    def zip(self):
-        return Zip(self)
+    def zip(self, *args):
+        return Zip(self, *args)
 
     def group(self, *args, **kwargs):
         return Group(self, *[func_wrap(arg) for arg in args], **kwargs)
 
-    def for_each(self, mapping):
-        return ForEach(self, func_wrap(mapping))
+    def for_each(self, *args):
+        return ForEach(self, *[func_wrap(arg) for arg in args])
 
-    def info(self):
-        return Info(self)
+    def info(self, *args):
+        return Info(self, *args)
 
     # Array only operations
-    def insert_at(self, index, value):
-        return InsertAt(self, index, value)
+    def insert_at(self, *args):
+        return InsertAt(self, *args)
 
-    def splice_at(self, index, values):
-        return SpliceAt(self, index, values)
+    def splice_at(self, *args):
+        return SpliceAt(self, *args)
 
-    def delete_at(self, *indexes):
-        return DeleteAt(self, *indexes);
+    def delete_at(self, *args):
+        return DeleteAt(self, *args);
 
-    def change_at(self, index, value):
-        return ChangeAt(self, index, value);
+    def change_at(self, *args):
+        return ChangeAt(self, *args);
 
-    def sample(self, count):
-        return Sample(self, count)
+    def sample(self, *args):
+        return Sample(self, *args)
 
     ## Time support
 
-    def to_iso8601(self):
-        return ToISO8601(self)
+    def to_iso8601(self, *args):
+        return ToISO8601(self, *args)
 
-    def to_epoch_time(self):
-        return ToEpochTime(self)
+    def to_epoch_time(self, *args):
+        return ToEpochTime(self, *args)
 
-    def during(self, t2, t3, left_bound=(), right_bound=()):
-        return During(self, t2, t3, left_bound=left_bound, right_bound=right_bound)
+    def during(self, *args, **kwargs):
+        kwargs.setdefault('left_bound', ())
+        kwargs.setdefault('right_bound', ())
+        return During(self, *args, **kwargs)
 
-    def date(self):
-        return Date(self)
+    def date(self, *args):
+        return Date(self, *args)
 
-    def time_of_day(self):
-        return TimeOfDay(self)
+    def time_of_day(self, *args):
+        return TimeOfDay(self, *args)
 
-    def timezone(self):
-        return Timezone(self)
+    def timezone(self, *args):
+        return Timezone(self, *args)
 
-    def year(self):
-        return Year(self)
+    def year(self, *args):
+        return Year(self, *args)
 
-    def month(self):
-        return Month(self)
+    def month(self, *args):
+        return Month(self, *args)
 
-    def day(self):
-        return Day(self)
+    def day(self, *args):
+        return Day(self, *args)
 
-    def day_of_week(self):
-        return DayOfWeek(self)
+    def day_of_week(self, *args):
+        return DayOfWeek(self, *args)
 
-    def day_of_year(self):
-        return DayOfYear(self)
+    def day_of_year(self, *args):
+        return DayOfYear(self, *args)
 
-    def hours(self):
-        return Hours(self)
+    def hours(self, *args):
+        return Hours(self, *args)
 
-    def minutes(self):
-        return Minutes(self)
+    def minutes(self, *args):
+        return Minutes(self, *args)
 
-    def seconds(self):
-        return Seconds(self)
+    def seconds(self, *args):
+        return Seconds(self, *args)
 
-    def in_timezone(self, tzstr):
-        return InTimezone(self, tzstr)
+    def in_timezone(self, *args):
+        return InTimezone(self, *args)
 
 # These classes define how nodes are printed by overloading `compose`
 
@@ -506,13 +489,11 @@ def needs_wrap(arg):
 
 class RqlBoolOperQuery(RqlQuery):
     def __init__(self, *args, **optargs):
-        if 'infix' in optargs:
-            self.infix = optargs['infix']
-            del optargs['infix']
-        else:
-            self.infix = False
-
+        self.infix = False
         RqlQuery.__init__(self, *args, **optargs)
+
+    def set_infix(self):
+        self.infix = True
 
     def compose(self, args, optargs):
         t_args = [T('r.expr(', args[i], ')') if needs_wrap(self.args[i]) else args[i] for i in xrange(len(args))]
@@ -545,16 +526,19 @@ class RqlBiCompareOperQuery(RqlBiOperQuery):
 
 class RqlTopLevelQuery(RqlQuery):
     def compose(self, args, optargs):
-        args.extend([T(k, '=', v) for k,v in optargs.items()])
+        args.extend([T(k, '=', v) for (k,v) in optargs.iteritems()])
         return T('r.', self.st, '(', T(*(args), intsp=', '), ')')
 
 class RqlMethodQuery(RqlQuery):
     def compose(self, args, optargs):
+        if len(args) == 0:
+            return T('r.', self.st, '()')
+
         if needs_wrap(self.args[0]):
             args[0] = T('r.expr(', args[0], ')')
 
         restargs = args[1:]
-        restargs.extend([T(k, '=', v) for k,v in optargs.items()])
+        restargs.extend([T(k, '=', v) for (k,v) in optargs.iteritems()])
         restargs = T(*restargs, intsp=', ')
 
         return T(args[0], '.', self.st, '(', restargs, ')')
@@ -618,14 +602,44 @@ def recursively_make_hashable(obj):
     if isinstance(obj, list):
         return tuple([recursively_make_hashable(i) for i in obj])
     elif isinstance(obj, dict):
-        return frozenset([(k, recursively_make_hashable(v)) for (k,v) in obj.items()])
+        return frozenset([(k, recursively_make_hashable(v)) for (k,v) in obj.iteritems()])
     return obj
 
 def reql_type_grouped_data_to_object(obj):
     if not 'data' in obj:
         raise RqlDriverError('pseudo-type GROUPED_DATA object %s does not have the expected field "data".' % py_json.dumps(obj))
-
     return dict([(recursively_make_hashable(k),v) for (k,v) in obj['data']])
+
+def convert_pseudotype(obj, format_opts):
+    reql_type = obj.get('$reql_type$')
+    if reql_type is not None:
+        if reql_type == 'TIME':
+            time_format = format_opts.get('time_format')
+            if time_format is None or time_format == 'native':
+                # Convert to native python datetime object
+                return reql_type_time_to_datetime(obj)
+            elif time_format != 'raw':
+                raise RqlDriverError("Unknown time_format run option \"%s\"." % time_format)
+        elif reql_type == 'GROUPED_DATA':
+            group_format = format_opts.get('group_format')
+            if group_format is None or group_format == 'native':
+                return reql_type_grouped_data_to_object(obj)
+            elif group_format != 'raw':
+                raise RqlDriverError("Unknown group_format run option \"%s\"." % group_format)
+        else:
+            raise RqlDriverError("Unknown pseudo-type %s" % reql_type)
+    # If there was no pseudotype, or the time format is raw, return the original object
+    return obj
+
+def recursively_convert_pseudotypes(obj, format_opts):
+    if isinstance(obj, dict):
+        for (key, value) in obj.iteritems():
+            obj[key] = recursively_convert_pseudotypes(value, format_opts)
+        obj = convert_pseudotype(obj, format_opts)
+    elif isinstance(obj, list):
+        for i in xrange(len(obj)):
+            obj[i] = recursively_convert_pseudotypes(obj[i], format_opts)
+    return obj
 
 # This class handles the conversion of RQL terminal types in both directions
 # Going to the server though it does not support R_ARRAY or R_OBJECT as those
@@ -641,109 +655,23 @@ class Datum(RqlQuery):
     def __init__(self, val):
         self.data = val
 
-    def build(self, term):
-        term.type = p.Term.DATUM
-
-        if self.data == None:
-            term.datum.type = p.Datum.R_NULL
-        elif isinstance(self.data, bool):
-            term.datum.type = p.Datum.R_BOOL
-            term.datum.r_bool = self.data
-        elif isinstance(self.data, numbers.Real):
-            term.datum.type = p.Datum.R_NUM
-            term.datum.r_num = self.data
-        elif isinstance(self.data, types.StringTypes):
-            term.datum.type = p.Datum.R_STR
-            term.datum.r_str = self.data
-        else:
-            raise RqlDriverError("Cannot build a query from a %s" % type(self.data).__name__)
+    def build(self):
+        return self.data
 
     def compose(self, args, optargs):
         return repr(self.data)
 
-    @staticmethod
-    def _convert_pseudotype(obj, format_opts):
-        reql_type = obj.get('$reql_type$')
-        if reql_type is not None:
-            if reql_type == 'TIME':
-                time_format = format_opts.get('time_format')
-                if time_format is None or time_format == 'native':
-                    # Convert to native python datetime object
-                    return reql_type_time_to_datetime(obj)
-                elif time_format != 'raw':
-                    raise RqlDriverError("Unknown time_format run option \"%s\"." % time_format)
-            elif reql_type == 'GROUPED_DATA':
-                group_format = format_opts.get('group_format')
-                if group_format is None or group_format == 'native':
-                    return reql_type_grouped_data_to_object(obj)
-                elif group_format != 'raw':
-                    raise RqlDriverError("Unknown group_format run option \"%s\"." % group_format)
-            else:
-                raise RqlDriverError("Unknown pseudo-type %s" % reql_type)
-        # If there was no pseudotype, or the time format is raw, return the original object
-        return obj
-
-    @staticmethod
-    def _recursively_convert_pseudotypes(obj, format_opts):
-        if isinstance(obj, dict):
-            for (key, value) in obj.iteritems():
-                obj[key] = Datum._recursively_convert_pseudotypes(value, format_opts)
-            obj = Datum._convert_pseudotype(obj, format_opts)
-        elif isinstance(obj, list):
-            for i in xrange(len(obj)):
-                obj[i] = Datum._recursively_convert_pseudotypes(obj[i], format_opts)
-        return obj
-
-    @staticmethod
-    def deconstruct(datum, format_opts={}):
-        d_type = datum.type
-        if d_type == p.Datum.R_JSON:
-            obj = py_json.loads(datum.r_str)
-            return Datum._recursively_convert_pseudotypes(obj, format_opts)
-        elif d_type == p.Datum.R_OBJECT:
-            obj = { }
-            for pair in datum.r_object:
-                obj[pair.key] = Datum.deconstruct(pair.val, format_opts)
-
-            # Thanks to "pseudo-types" we can't yet be quite sure if this object is meant to
-            # be an object or something else. We need a second layer of type switching, this
-            # time on an obfuscated field "$reql_type$" rather than the datum type field we
-            # already switched on.
-            Datum._convert_pseudotype(obj, format_opts)
-            return obj
-        elif d_type == p.Datum.R_ARRAY:
-            array = datum.r_array
-            return [Datum.deconstruct(e, format_opts) for e in array]
-        elif d_type == p.Datum.R_STR:
-            return datum.r_str
-        elif d_type == p.Datum.R_NUM:
-            # Convert to an integer if we think maybe the user might think of this
-            # number as an integer. I have been assured that this is a "temporary"
-            # behavior change until RQL supports native integers.
-            num = datum.r_num
-            if num % 1 == 0:
-                # Then we assume that in the user's data model this floating point
-                # number is meant be an integer and "helpfully" convert types for them.
-                num = int(num)
-            return num
-        elif d_type == p.Datum.R_BOOL:
-            return datum.r_bool
-        elif d_type == p.Datum.R_NULL:
-            return None
-        else:
-            raise RuntimeError("Unknown Datum type %d encountered in response." % datum.type)
-
 class MakeArray(RqlQuery):
-    tt = p.Term.MAKE_ARRAY
+    tt = pTerm.MAKE_ARRAY
 
     def compose(self, args, optargs):
         return T('[', T(*args, intsp=', '),']')
 
-    def do(self, func):
-        return FunCall(func_wrap(func), self)
+    def do(self, *args):
+        return FunCall(self, *args)
 
 class MakeObj(RqlQuery):
-    tt = p.Term.MAKE_OBJ
+    tt = pTerm.MAKE_OBJ
 
     # We cannot inherit from RqlQuery because of potential conflicts with
     # the `self` parameter. This is not a problem for other RqlQuery sub-
@@ -752,64 +680,83 @@ class MakeObj(RqlQuery):
         self.args = []
 
         self.optargs = {}
-        for k in obj_dict.keys():
+        for (k,v) in obj_dict.iteritems():
             if not isinstance(k, types.StringTypes):
                 raise RqlDriverError("Object keys must be strings.");
-            self.optargs[k] = expr(obj_dict[k])
+            self.optargs[k] = expr(v)
+
+    def build(self):
+        res = { }
+        for (k,v) in self.optargs.iteritems():
+            k = k.build() if isinstance(k, RqlQuery) else k
+            res[k] = v.build() if isinstance(v, RqlQuery) else v
+        return res
 
     def compose(self, args, optargs):
-        return T('{', T(*[T(repr(name), ': ', optargs[name]) for name in optargs.keys()], intsp=', '), '}')
+        return T('r.expr({', T(*[T(repr(k), ': ', v) for (k,v) in optargs.iteritems()], intsp=', '), '})')
 
 class Var(RqlQuery):
-    tt = p.Term.VAR
+    tt = pTerm.VAR
 
     def compose(self, args, optargs):
         return 'var_'+args[0]
 
 class JavaScript(RqlTopLevelQuery):
-    tt = p.Term.JAVASCRIPT
+    tt = pTerm.JAVASCRIPT
     st = "js"
 
+class Http(RqlTopLevelQuery):
+    tt = pTerm.HTTP
+    st = "http"
+
 class UserError(RqlTopLevelQuery):
-    tt = p.Term.ERROR
+    tt = pTerm.ERROR
     st = "error"
 
+class Random(RqlTopLevelQuery):
+    tt = pTerm.RANDOM
+    st = "random"
+
+class Changes(RqlMethodQuery):
+    tt = pTerm.CHANGES
+    st = "changes"
+
 class Default(RqlMethodQuery):
-    tt = p.Term.DEFAULT
+    tt = pTerm.DEFAULT
     st = "default"
 
 class ImplicitVar(RqlQuery):
-    tt = p.Term.IMPLICIT_VAR
+    tt = pTerm.IMPLICIT_VAR
 
     def compose(self, args, optargs):
         return 'r.row'
 
 class Eq(RqlBiCompareOperQuery):
-    tt = p.Term.EQ
+    tt = pTerm.EQ
     st = "=="
 
 class Ne(RqlBiCompareOperQuery):
-    tt = p.Term.NE
+    tt = pTerm.NE
     st = "!="
 
 class Lt(RqlBiCompareOperQuery):
-    tt = p.Term.LT
+    tt = pTerm.LT
     st = "<"
 
 class Le(RqlBiCompareOperQuery):
-    tt = p.Term.LE
+    tt = pTerm.LE
     st = "<="
 
 class Gt(RqlBiCompareOperQuery):
-    tt = p.Term.GT
+    tt = pTerm.GT
     st = ">"
 
 class Ge(RqlBiCompareOperQuery):
-    tt = p.Term.GE
+    tt = pTerm.GE
     st = ">="
 
 class Not(RqlQuery):
-    tt = p.Term.NOT
+    tt = pTerm.NOT
 
     def compose(self, args, optargs):
         if isinstance(self.args[0], Datum):
@@ -817,55 +764,55 @@ class Not(RqlQuery):
         return T('(~', args[0], ')')
 
 class Add(RqlBiOperQuery):
-    tt = p.Term.ADD
+    tt = pTerm.ADD
     st = "+"
 
 class Sub(RqlBiOperQuery):
-    tt = p.Term.SUB
+    tt = pTerm.SUB
     st = "-"
 
 class Mul(RqlBiOperQuery):
-    tt = p.Term.MUL
+    tt = pTerm.MUL
     st = "*"
 
 class Div(RqlBiOperQuery):
-    tt = p.Term.DIV
+    tt = pTerm.DIV
     st = "/"
 
 class Mod(RqlBiOperQuery):
-    tt = p.Term.MOD
+    tt = pTerm.MOD
     st = "%"
 
 class Append(RqlMethodQuery):
-    tt = p.Term.APPEND
+    tt = pTerm.APPEND
     st = "append"
 
 class Prepend(RqlMethodQuery):
-    tt = p.Term.PREPEND
+    tt = pTerm.PREPEND
     st = "prepend"
 
 class Difference(RqlMethodQuery):
-    tt = p.Term.DIFFERENCE
+    tt = pTerm.DIFFERENCE
     st = "difference"
 
 class SetInsert(RqlMethodQuery):
-    tt = p.Term.SET_INSERT
+    tt = pTerm.SET_INSERT
     st = "set_insert"
 
 class SetUnion(RqlMethodQuery):
-    tt = p.Term.SET_UNION
+    tt = pTerm.SET_UNION
     st = "set_union"
 
 class SetIntersection(RqlMethodQuery):
-    tt = p.Term.SET_INTERSECTION
+    tt = pTerm.SET_INTERSECTION
     st = "set_intersection"
 
 class SetDifference(RqlMethodQuery):
-    tt = p.Term.SET_DIFFERENCE
+    tt = pTerm.SET_DIFFERENCE
     st = "set_difference"
 
 class Slice(RqlBracketQuery):
-    tt = p.Term.SLICE
+    tt = pTerm.SLICE
     st = 'slice'
 
     # Slice has a special bracket syntax, implemented here
@@ -878,75 +825,89 @@ class Slice(RqlBracketQuery):
             return RqlBracketQuery.compose(self, args, optargs)
 
 class Skip(RqlMethodQuery):
-    tt = p.Term.SKIP
+    tt = pTerm.SKIP
     st = 'skip'
 
 class Limit(RqlMethodQuery):
-    tt = p.Term.LIMIT
+    tt = pTerm.LIMIT
     st = 'limit'
 
 class GetField(RqlBracketQuery):
-    tt = p.Term.GET_FIELD
+    tt = pTerm.GET_FIELD
     st = 'get_field'
 
 class Contains(RqlMethodQuery):
-    tt = p.Term.CONTAINS
+    tt = pTerm.CONTAINS
     st = 'contains'
 
 class HasFields(RqlMethodQuery):
-    tt = p.Term.HAS_FIELDS
+    tt = pTerm.HAS_FIELDS
     st = 'has_fields'
 
 class WithFields(RqlMethodQuery):
-    tt = p.Term.WITH_FIELDS
+    tt = pTerm.WITH_FIELDS
     st = 'with_fields'
 
 class Keys(RqlMethodQuery):
-    tt = p.Term.KEYS
+    tt = pTerm.KEYS
     st = 'keys'
 
 class Object(RqlMethodQuery):
-    tt = p.Term.OBJECT
+    tt = pTerm.OBJECT
     st = 'object'
 
 class Pluck(RqlMethodQuery):
-    tt = p.Term.PLUCK
+    tt = pTerm.PLUCK
     st = 'pluck'
 
 class Without(RqlMethodQuery):
-    tt = p.Term.WITHOUT
+    tt = pTerm.WITHOUT
     st = 'without'
 
 class Merge(RqlMethodQuery):
-    tt = p.Term.MERGE
+    tt = pTerm.MERGE
     st = 'merge'
 
 class Between(RqlMethodQuery):
-    tt = p.Term.BETWEEN
+    tt = pTerm.BETWEEN
     st = 'between'
 
 class DB(RqlTopLevelQuery):
-    tt = p.Term.DB
+    tt = pTerm.DB
     st = 'db'
 
-    def table_list(self):
-        return TableList(self)
+    def table_list(self, *args):
+        return TableList(self, *args)
 
-    def table_create(self, table_name, primary_key=(), datacenter=(), cache_size=(), durability=()):
-        return TableCreate(self, table_name, primary_key=primary_key, datacenter=datacenter, cache_size=cache_size, durability=durability)
+    def table_create(self, *args, **kwargs):
+        kwargs.setdefault('primary_key', ())
+        kwargs.setdefault('datacenter', ())
+        kwargs.setdefault('durability', ())
+        return TableCreate(self, *args, **kwargs)
 
-    def table_drop(self, table_name):
-        return TableDrop(self, table_name)
+    def table_drop(self, *args):
+        return TableDrop(self, *args)
 
-    def table(self, table_name, use_outdated=()):
-        return Table(self, table_name, use_outdated=use_outdated)
+    def table(self, *args, **kwargs):
+        kwargs.setdefault('use_outdated', ())
+        return Table(self, *args, **kwargs)
 
 class FunCall(RqlQuery):
-    tt = p.Term.FUNCALL
+    tt = pTerm.FUNCALL
+
+    # This object should be constructed with arguments first, and the function itself as
+    # the last parameter.  This makes it easier for the places where this object is
+    # constructed.  The actual wire format is function first, arguments last, so we flip
+    # them around before passing it down to the base class constructor.
+    def __init__(self, *args):
+        if len(args) == 0:
+            raise RqlDriverError("Expected 1 or more arguments but found 0.")
+        args = [func_wrap(args[-1])] + list(args[:-1])
+        RqlQuery.__init__(self, *args)
 
     def compose(self, args, optargs):
-        if len(args) > 2:
-            return T('r.do(', T(*(args[1:]), intsp=', '), ', ', args[0], ')')
+        if len(args) != 2:
+            return T('r.do(', T(T(*(args[1:]), intsp=', '), args[0], intsp=', '), ')')
 
         if isinstance(self.args[1], Datum):
             args[1] = T('r.expr(', args[1], ')')
@@ -954,383 +915,387 @@ class FunCall(RqlQuery):
         return T(args[1], '.do(', args[0], ')')
 
 class Table(RqlQuery):
-    tt = p.Term.TABLE
+    tt = pTerm.TABLE
     st = 'table'
 
-    def insert(self, records, upsert=(), durability=(), return_vals=()):
-        return Insert(self, exprJSON(records), upsert=upsert,
-                      durability=durability, return_vals=return_vals)
+    def insert(self, *args, **kwargs):
+        kwargs.setdefault('upsert', ())
+        kwargs.setdefault('durability', ())
+        kwargs.setdefault('return_vals', ())
+        return Insert(self, *[expr(arg) for arg in args], **kwargs)
 
-    def get(self, key):
-        return Get(self, key)
+    def get(self, *args):
+        return Get(self, *args)
 
-    def get_all(self, *keys, **kwargs):
-        return GetAll(self, *keys, **kwargs)
+    def get_all(self, *args, **kwargs):
+        return GetAll(self, *args, **kwargs)
 
-    def index_create(self, name, fundef=(), multi=()):
-        args = [self, name] + ([func_wrap(fundef)] if fundef else [])
-        kwargs = {"multi" : multi} if multi else {}
-        return IndexCreate(*args, **kwargs)
+    def index_create(self, *args, **kwargs):
+        kwargs.setdefault('multi', ())
+        if len(args) > 1:
+            args = [args[0]] + [func_wrap(arg) for arg in args[1:]]
+        return IndexCreate(self, *args, **kwargs)
 
-    def index_drop(self, name):
-        return IndexDrop(self, name)
+    def index_drop(self, *args):
+        return IndexDrop(self, *args)
 
-    def index_list(self):
-        return IndexList(self)
+    def index_list(self, *args):
+        return IndexList(self, *args)
 
-    def index_status(self, *indexes):
-        return IndexStatus(self, *indexes)
+    def index_status(self, *args):
+        return IndexStatus(self, *args)
 
-    def index_wait(self, *indexes):
-        return IndexWait(self, *indexes)
+    def index_wait(self, *args):
+        return IndexWait(self, *args)
 
-    def sync(self):
-        return Sync(self)
+    def sync(self, *args):
+        return Sync(self, *args)
 
     def compose(self, args, optargs):
         if isinstance(self.args[0], DB):
-            return T(args[0], '.table(', args[1], ')')
+            return T(args[0], '.table(', T(*(args[1:]), intsp=', '), ')')
         else:
-            return T('r.table(', args[0], ')')
+            return T('r.table(', T(*(args), intsp=', '), ')')
 
 class Get(RqlMethodQuery):
-    tt = p.Term.GET
+    tt = pTerm.GET
     st = 'get'
 
 class GetAll(RqlMethodQuery):
-    tt = p.Term.GET_ALL
+    tt = pTerm.GET_ALL
     st = 'get_all'
 
 class Reduce(RqlMethodQuery):
-    tt = p.Term.REDUCE
+    tt = pTerm.REDUCE
     st = 'reduce'
 
 class Sum(RqlMethodQuery):
-    tt = p.Term.SUM
+    tt = pTerm.SUM
     st = 'sum'
 
 class Avg(RqlMethodQuery):
-    tt = p.Term.AVG
+    tt = pTerm.AVG
     st = 'avg'
 
 class Min(RqlMethodQuery):
-    tt = p.Term.MIN
+    tt = pTerm.MIN
     st = 'min'
 
 class Max(RqlMethodQuery):
-    tt = p.Term.MAX
+    tt = pTerm.MAX
     st = 'max'
 
 class Map(RqlMethodQuery):
-    tt = p.Term.MAP
+    tt = pTerm.MAP
     st = 'map'
 
 class Filter(RqlMethodQuery):
-    tt = p.Term.FILTER
+    tt = pTerm.FILTER
     st = 'filter'
 
 class ConcatMap(RqlMethodQuery):
-    tt = p.Term.CONCATMAP
+    tt = pTerm.CONCATMAP
     st = 'concat_map'
 
 class OrderBy(RqlMethodQuery):
-    tt = p.Term.ORDERBY
+    tt = pTerm.ORDERBY
     st = 'order_by'
 
 class Distinct(RqlMethodQuery):
-    tt = p.Term.DISTINCT
+    tt = pTerm.DISTINCT
     st = 'distinct'
 
 class Count(RqlMethodQuery):
-    tt = p.Term.COUNT
+    tt = pTerm.COUNT
     st = 'count'
 
 class Union(RqlMethodQuery):
-    tt = p.Term.UNION
+    tt = pTerm.UNION
     st = 'union'
 
 class Nth(RqlBracketQuery):
-    tt = p.Term.NTH
+    tt = pTerm.NTH
     st = 'nth'
 
 class Match(RqlMethodQuery):
-    tt = p.Term.MATCH
+    tt = pTerm.MATCH
     st = 'match'
 
 class Split(RqlMethodQuery):
-    tt = p.Term.SPLIT
+    tt = pTerm.SPLIT
     st = 'split'
 
 class Upcase(RqlMethodQuery):
-    tt = p.Term.UPCASE
+    tt = pTerm.UPCASE
     st = 'upcase'
 
 class Downcase(RqlMethodQuery):
-    tt = p.Term.DOWNCASE
+    tt = pTerm.DOWNCASE
     st = 'downcase'
 
 class IndexesOf(RqlMethodQuery):
-    tt = p.Term.INDEXES_OF
+    tt = pTerm.INDEXES_OF
     st = 'indexes_of'
 
 class IsEmpty(RqlMethodQuery):
-    tt = p.Term.IS_EMPTY
+    tt = pTerm.IS_EMPTY
     st = 'is_empty'
 
 class Group(RqlMethodQuery):
-    tt = p.Term.GROUP
+    tt = pTerm.GROUP
     st = 'group'
 
 class InnerJoin(RqlMethodQuery):
-    tt = p.Term.INNER_JOIN
+    tt = pTerm.INNER_JOIN
     st = 'inner_join'
 
 class OuterJoin(RqlMethodQuery):
-    tt = p.Term.OUTER_JOIN
+    tt = pTerm.OUTER_JOIN
     st = 'outer_join'
 
 class EqJoin(RqlMethodQuery):
-    tt = p.Term.EQ_JOIN
+    tt = pTerm.EQ_JOIN
     st = 'eq_join'
 
 class Zip(RqlMethodQuery):
-    tt = p.Term.ZIP
+    tt = pTerm.ZIP
     st = 'zip'
 
 class CoerceTo(RqlMethodQuery):
-    tt = p.Term.COERCE_TO
+    tt = pTerm.COERCE_TO
     st = 'coerce_to'
 
 class Ungroup(RqlMethodQuery):
-    tt = p.Term.UNGROUP
+    tt = pTerm.UNGROUP
     st = 'ungroup'
 
 class TypeOf(RqlMethodQuery):
-    tt = p.Term.TYPEOF
+    tt = pTerm.TYPEOF
     st = 'type_of'
 
 class Update(RqlMethodQuery):
-    tt = p.Term.UPDATE
+    tt = pTerm.UPDATE
     st = 'update'
 
 class Delete(RqlMethodQuery):
-    tt = p.Term.DELETE
+    tt = pTerm.DELETE
     st = 'delete'
 
 class Replace(RqlMethodQuery):
-    tt = p.Term.REPLACE
+    tt = pTerm.REPLACE
     st = 'replace'
 
 class Insert(RqlMethodQuery):
-    tt = p.Term.INSERT
+    tt = pTerm.INSERT
     st = 'insert'
 
 class DbCreate(RqlTopLevelQuery):
-    tt = p.Term.DB_CREATE
+    tt = pTerm.DB_CREATE
     st = "db_create"
 
 class DbDrop(RqlTopLevelQuery):
-    tt = p.Term.DB_DROP
+    tt = pTerm.DB_DROP
     st = "db_drop"
 
 class DbList(RqlTopLevelQuery):
-    tt = p.Term.DB_LIST
+    tt = pTerm.DB_LIST
     st = "db_list"
 
 class TableCreate(RqlMethodQuery):
-    tt = p.Term.TABLE_CREATE
+    tt = pTerm.TABLE_CREATE
     st = "table_create"
 
 class TableCreateTL(RqlTopLevelQuery):
-    tt = p.Term.TABLE_CREATE
+    tt = pTerm.TABLE_CREATE
     st = "table_create"
 
 class TableDrop(RqlMethodQuery):
-    tt = p.Term.TABLE_DROP
+    tt = pTerm.TABLE_DROP
     st = "table_drop"
 
 class TableDropTL(RqlTopLevelQuery):
-    tt = p.Term.TABLE_DROP
+    tt = pTerm.TABLE_DROP
     st = "table_drop"
 
 class TableList(RqlMethodQuery):
-    tt = p.Term.TABLE_LIST
+    tt = pTerm.TABLE_LIST
     st = "table_list"
 
 class TableListTL(RqlTopLevelQuery):
-    tt = p.Term.TABLE_LIST
+    tt = pTerm.TABLE_LIST
     st = "table_list"
 
 class IndexCreate(RqlMethodQuery):
-    tt = p.Term.INDEX_CREATE
+    tt = pTerm.INDEX_CREATE
     st = 'index_create'
 
 class IndexDrop(RqlMethodQuery):
-    tt = p.Term.INDEX_DROP
+    tt = pTerm.INDEX_DROP
     st = 'index_drop'
 
 class IndexList(RqlMethodQuery):
-    tt = p.Term.INDEX_LIST
+    tt = pTerm.INDEX_LIST
     st = 'index_list'
 
 class IndexStatus(RqlMethodQuery):
-    tt = p.Term.INDEX_STATUS
+    tt = pTerm.INDEX_STATUS
     st = 'index_status'
 
 class IndexWait(RqlMethodQuery):
-    tt = p.Term.INDEX_WAIT
+    tt = pTerm.INDEX_WAIT
     st = 'index_wait'
 
 class Sync(RqlMethodQuery):
-    tt = p.Term.SYNC
+    tt = pTerm.SYNC
     st = 'sync'
 
 class Branch(RqlTopLevelQuery):
-    tt = p.Term.BRANCH
+    tt = pTerm.BRANCH
     st = "branch"
 
 class Any(RqlBoolOperQuery):
-    tt = p.Term.ANY
+    tt = pTerm.ANY
     st = "or_"
     st_infix = "|"
 
 class All(RqlBoolOperQuery):
-    tt = p.Term.ALL
+    tt = pTerm.ALL
     st = "and_"
     st_infix = "&"
 
 class ForEach(RqlMethodQuery):
-    tt = p.Term.FOREACH
+    tt = pTerm.FOREACH
     st = 'for_each'
 
 class Info(RqlMethodQuery):
-    tt = p.Term.INFO
+    tt = pTerm.INFO
     st = 'info'
 
 class InsertAt(RqlMethodQuery):
-    tt = p.Term.INSERT_AT
+    tt = pTerm.INSERT_AT
     st = 'insert_at'
 
 class SpliceAt(RqlMethodQuery):
-    tt = p.Term.SPLICE_AT
+    tt = pTerm.SPLICE_AT
     st = 'splice_at'
 
 class DeleteAt(RqlMethodQuery):
-    tt = p.Term.DELETE_AT
+    tt = pTerm.DELETE_AT
     st = 'delete_at'
 
 class ChangeAt(RqlMethodQuery):
-    tt = p.Term.CHANGE_AT
+    tt = pTerm.CHANGE_AT
     st = 'change_at'
 
 class Sample(RqlMethodQuery):
-    tt = p.Term.SAMPLE
+    tt = pTerm.SAMPLE
     st = 'sample'
 
 class Json(RqlTopLevelQuery):
-    tt = p.Term.JSON
+    tt = pTerm.JSON
     st = 'json'
 
+class Args(RqlTopLevelQuery):
+    tt = pTerm.ARGS
+    st = 'args'
+
 class ToISO8601(RqlMethodQuery):
-    tt = p.Term.TO_ISO8601
+    tt = pTerm.TO_ISO8601
     st = 'to_iso8601'
 
 class During(RqlMethodQuery):
-    tt = p.Term.DURING
+    tt = pTerm.DURING
     st = 'during'
 
 class Date(RqlMethodQuery):
-    tt = p.Term.DATE
+    tt = pTerm.DATE
     st = 'date'
 
 class TimeOfDay(RqlMethodQuery):
-    tt = p.Term.TIME_OF_DAY
+    tt = pTerm.TIME_OF_DAY
     st = 'time_of_day'
 
 class Timezone(RqlMethodQuery):
-    tt = p.Term.TIMEZONE
+    tt = pTerm.TIMEZONE
     st = 'timezone'
 
 class Year(RqlMethodQuery):
-    tt = p.Term.YEAR
+    tt = pTerm.YEAR
     st = 'year'
 
 class Month(RqlMethodQuery):
-    tt = p.Term.MONTH
+    tt = pTerm.MONTH
     st = 'month'
 
 class Day(RqlMethodQuery):
-    tt = p.Term.DAY
+    tt = pTerm.DAY
     st = 'day'
 
 class DayOfWeek(RqlMethodQuery):
-    tt = p.Term.DAY_OF_WEEK
+    tt = pTerm.DAY_OF_WEEK
     st = 'day_of_week'
 
 class DayOfYear(RqlMethodQuery):
-    tt = p.Term.DAY_OF_YEAR
+    tt = pTerm.DAY_OF_YEAR
     st = 'day_of_year'
 
 class Hours(RqlMethodQuery):
-    tt = p.Term.HOURS
+    tt = pTerm.HOURS
     st = 'hours'
 
 class Minutes(RqlMethodQuery):
-    tt = p.Term.MINUTES
+    tt = pTerm.MINUTES
     st = 'minutes'
 
 class Seconds(RqlMethodQuery):
-    tt = p.Term.SECONDS
+    tt = pTerm.SECONDS
     st = 'seconds'
 
 class Time(RqlTopLevelQuery):
-    tt = p.Term.TIME
+    tt = pTerm.TIME
     st = 'time'
 
 class ISO8601(RqlTopLevelQuery):
-    tt = p.Term.ISO8601
+    tt = pTerm.ISO8601
     st = 'iso8601'
 
 class EpochTime(RqlTopLevelQuery):
-    tt = p.Term.EPOCH_TIME
+    tt = pTerm.EPOCH_TIME
     st = 'epoch_time'
 
 class Now(RqlTopLevelQuery):
-    tt = p.Term.NOW
+    tt = pTerm.NOW
     st = 'now'
 
 class InTimezone(RqlMethodQuery):
-    tt = p.Term.IN_TIMEZONE
+    tt = pTerm.IN_TIMEZONE
     st = 'in_timezone'
 
 class ToEpochTime(RqlMethodQuery):
-    tt = p.Term.TO_EPOCH_TIME
+    tt = pTerm.TO_EPOCH_TIME
     st = 'to_epoch_time'
+
+# Returns True if IMPLICIT_VAR is found in the subquery
+def _ivar_scan(query):
+    if not isinstance(query, RqlQuery):
+        return False
+    if isinstance(query, ImplicitVar):
+        return True
+    if any([_ivar_scan(arg) for arg in query.args]):
+        return True
+    if any([_ivar_scan(arg) for k,arg in query.optargs.iteritems()]):
+        return True
+    return False
 
 # Called on arguments that should be functions
 def func_wrap(val):
     val = expr(val)
-
-    # Scan for IMPLICIT_VAR or JS
-    def ivar_scan(node):
-        if not isinstance(node, RqlQuery):
-            return False
-
-        if isinstance(node, ImplicitVar):
-            return True
-        if any([ivar_scan(arg) for arg in node.args]):
-            return True
-        if any([ivar_scan(arg) for k,arg in node.optargs.items()]):
-            return True
-        return False
-
-    if ivar_scan(val):
+    if _ivar_scan(val):
         return Func(lambda x: val)
-
     return val
 
 class Func(RqlQuery):
-    tt = p.Term.FUNC
+    tt = pTerm.FUNC
     lock = Lock()
     nextVarId = 1
 
@@ -1353,13 +1318,13 @@ class Func(RqlQuery):
             return T('lambda ', T(*[v.compose([v.args[0].compose(None, None)], []) for v in self.vrs], intsp=', '), ': ', args[1])
 
 class Asc(RqlTopLevelQuery):
-    tt = p.Term.ASC
+    tt = pTerm.ASC
     st = 'asc'
 
 class Desc(RqlTopLevelQuery):
-    tt = p.Term.DESC
+    tt = pTerm.DESC
     st = 'desc'
 
 class Literal(RqlTopLevelQuery):
-    tt = p.Term.LITERAL
+    tt = pTerm.LITERAL
     st = 'literal'

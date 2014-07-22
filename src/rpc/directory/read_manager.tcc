@@ -1,4 +1,4 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2014 RethinkDB, all rights reserved.
 #ifndef RPC_DIRECTORY_READ_MANAGER_TCC_
 #define RPC_DIRECTORY_READ_MANAGER_TCC_
 
@@ -10,6 +10,7 @@
 #include "concurrency/wait_any.hpp"
 #include "config/args.hpp"
 #include "containers/archive/archive.hpp"
+#include "containers/archive/versioned.hpp"
 #include "stl_utils.hpp"
 
 template<class metadata_t>
@@ -30,19 +31,21 @@ directory_read_manager_t<metadata_t>::~directory_read_manager_t() THROWS_NOTHING
 template<class metadata_t>
 void directory_read_manager_t<metadata_t>::on_connect(peer_id_t peer) THROWS_NOTHING {
     assert_thread();
-    std::pair<typename boost::ptr_map<peer_id_t, session_t>::iterator, bool> res = sessions.insert(peer, new session_t(connectivity_service->get_connection_session_id(peer)));
+    auto res = sessions.insert(std::make_pair(peer, make_scoped<session_t>(connectivity_service->get_connection_session_id(peer))));
     guarantee(res.second);
 }
 
 template<class metadata_t>
-void directory_read_manager_t<metadata_t>::on_message(peer_id_t source_peer,
+void directory_read_manager_t<metadata_t>::on_message(
+        peer_id_t source_peer,
+        cluster_version_t cluster_version,
         read_stream_t *s) THROWS_ONLY(fake_archive_exc_t) {
-
     with_priority_t p(CORO_PRIORITY_DIRECTORY_CHANGES);
 
     uint8_t code = 0;
     {
-        archive_result_t res = deserialize(s, &code);
+        // All cluster versions use the uint8_t code here.
+        archive_result_t res = deserialize_universal(s, &code);
         if (res != archive_result_t::SUCCESS) { throw fake_archive_exc_t(); }
     }
 
@@ -52,15 +55,15 @@ void directory_read_manager_t<metadata_t>::on_message(peer_id_t source_peer,
             boost::shared_ptr<metadata_t> initial_value(new metadata_t());
             fifo_enforcer_state_t metadata_fifo_state;
             {
-                archive_result_t res = deserialize(s, initial_value.get());
+                archive_result_t res = deserialize_for_version(cluster_version, s, initial_value.get());
                 if (res != archive_result_t::SUCCESS) { throw fake_archive_exc_t(); }
-                res = deserialize(s, &metadata_fifo_state);
+                res = deserialize_for_version(cluster_version, s, &metadata_fifo_state);
                 if (res != archive_result_t::SUCCESS) { throw fake_archive_exc_t(); }
             }
 
             /* Spawn a new coroutine because we might not be on the home thread
             and `on_message()` isn't supposed to block very long */
-            coro_t::spawn_sometime(boost::bind(
+            coro_t::spawn_sometime(std::bind(
                 &directory_read_manager_t::propagate_initialization, this,
                 source_peer, connectivity_service->get_connection_session_id(source_peer),
                 initial_value, metadata_fifo_state,
@@ -74,15 +77,15 @@ void directory_read_manager_t<metadata_t>::on_message(peer_id_t source_peer,
             boost::shared_ptr<metadata_t> new_value(new metadata_t());
             fifo_enforcer_write_token_t metadata_fifo_token;
             {
-                archive_result_t res = deserialize(s, new_value.get());
+                archive_result_t res = deserialize_for_version(cluster_version, s, new_value.get());
                 if (res != archive_result_t::SUCCESS) { throw fake_archive_exc_t(); }
-                res = deserialize(s, &metadata_fifo_token);
+                res = deserialize_for_version(cluster_version, s, &metadata_fifo_token);
                 if (res != archive_result_t::SUCCESS) { throw fake_archive_exc_t(); }
             }
 
             /* Spawn a new coroutine because we might not be on the home thread
             and `on_message()` isn't supposed to block very long */
-            coro_t::spawn_sometime(boost::bind(
+            coro_t::spawn_sometime(std::bind(
                 &directory_read_manager_t::propagate_update, this,
                 source_peer, connectivity_service->get_connection_session_id(source_peer),
                 new_value, metadata_fifo_token,
@@ -101,9 +104,12 @@ void directory_read_manager_t<metadata_t>::on_disconnect(peer_id_t peer) THROWS_
     assert_thread();
 
     /* Remove the `global_peer_info_t` object from the table */
-    typename boost::ptr_map<peer_id_t, session_t>::iterator it = sessions.find(peer);
+    typename std::map<peer_id_t, scoped_ptr_t<session_t> >::iterator it
+        = sessions.find(peer);
     guarantee(it != sessions.end());
-    session_t *session_to_destroy = sessions.release(it).release();
+
+    scoped_ptr_t<session_t> session_to_destroy = std::move(it->second);
+    sessions.erase(it);
 
     bool got_initialization = session_to_destroy->got_initial_message.is_pulsed();
 
@@ -111,9 +117,9 @@ void directory_read_manager_t<metadata_t>::on_disconnect(peer_id_t peer) THROWS_
     explicitly interrupt them rather than letting them finish on their own
     because, if the network reordered messages, they might wait indefinitely for
     a message that will now never come. */
-    coro_t::spawn_sometime(boost::bind(
+    coro_t::spawn_sometime(std::bind(
         &directory_read_manager_t::interrupt_updates_and_free_session, this,
-        session_to_destroy,
+        session_to_destroy.release(),
         auto_drainer_t::lock_t(&global_drainer)));
 
     /* Notify that the peer has disconnected */
@@ -142,12 +148,13 @@ void directory_read_manager_t<metadata_t>::propagate_initialization(peer_id_t pe
     ASSERT_FINITE_CORO_WAITING;
     /* Check to make sure that the peer didn't die while we were coming from the
     thread on which `on_message()` was run */
-    typename boost::ptr_map<peer_id_t, session_t>::iterator it = sessions.find(peer);
+    typename std::map<peer_id_t, scoped_ptr_t<session_t> >::iterator it
+        = sessions.find(peer);
     if (it == sessions.end()) {
         /* The peer disconnected since we got the message; ignore. */
         return;
     }
-    session_t *session = it->second;
+    session_t *session = it->second.get();
     if (session->session_id != session_id) {
         /* The peer disconnected and then reconnected since we got the message;
         ignore. */
@@ -189,12 +196,13 @@ void directory_read_manager_t<metadata_t>::propagate_update(peer_id_t peer, uuid
 
     /* Check to make sure that the peer didn't die while we were coming from the
     thread on which `on_message()` was run */
-    typename boost::ptr_map<peer_id_t, session_t>::iterator it = sessions.find(peer);
+    typename std::map<peer_id_t, scoped_ptr_t<session_t> >::iterator it
+        = sessions.find(peer);
     if (it == sessions.end()) {
         /* The peer disconnected since we got the message; ignore. */
         return;
     }
-    session_t *session = it->second;
+    session_t *session = it->second.get();
     if (session->session_id != session_id) {
         /* The peer disconnected and then reconnected since we got the message;
         ignore. */
@@ -225,7 +233,7 @@ void directory_read_manager_t<metadata_t>::propagate_update(peer_id_t peer, uuid
             struct op_closure_t {
                 static bool apply(const peer_id_t _peer,
                                   const boost::shared_ptr<metadata_t> &_new_value,
-                                  const boost::ptr_map<peer_id_t, session_t> &_sessions,
+                                  const std::map<peer_id_t, scoped_ptr_t<session_t> > &_sessions,
                                   change_tracking_map_t<peer_id_t, metadata_t> *map) {
                     typename std::map<peer_id_t, metadata_t>::const_iterator var_it
                         = map->get_inner().find(_peer);

@@ -14,7 +14,7 @@
 #include "errors.hpp"
 #include <boost/optional.hpp>
 
-#include "clustering/administration/namespace_interface_repository.hpp"
+#include "rdb_protocol/context.hpp"
 #include "rdb_protocol/protocol.hpp"
 
 namespace ql {
@@ -32,34 +32,31 @@ class env_t;
  */
 class rdb_namespace_interface_t {
 public:
-    rdb_namespace_interface_t(
-        namespace_interface_t<rdb_protocol_t> *internal, env_t *env);
+    explicit rdb_namespace_interface_t(namespace_interface_t *internal);
 
-    void read(const rdb_protocol_t::read_t &,
-              rdb_protocol_t::read_response_t *response,
-              order_token_t tok,
-              signal_t *interruptor)
+    void read(env_t *env,
+              const read_t &,
+              read_response_t *response,
+              order_token_t tok)
         THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t);
-    void read_outdated(const rdb_protocol_t::read_t &,
-                       rdb_protocol_t::read_response_t *response,
-                       signal_t *interruptor)
+    void read_outdated(env_t *env,
+                       const read_t &,
+                       read_response_t *response)
         THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t);
-    void write(rdb_protocol_t::write_t *,
-               rdb_protocol_t::write_response_t *response,
-               order_token_t tok,
-               signal_t *interruptor)
+    void write(env_t *env,
+               write_t *,
+               write_response_t *response,
+               order_token_t tok)
         THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t);
 
     /* These calls are for the sole purpose of optimizing queries; don't rely
        on them for correctness. They should not block. */
-    std::set<rdb_protocol_t::region_t> get_sharding_scheme()
+    std::set<region_t> get_sharding_scheme()
         THROWS_ONLY(cannot_perform_query_exc_t);
     signal_t *get_initial_ready_signal();
-    /* Check if the internal value is null. */
-    bool has();
+
 private:
-    namespace_interface_t<rdb_protocol_t> *internal_;
-    env_t *env_;
+    namespace_interface_t *internal_;
 };
 
 class rdb_namespace_access_t {
@@ -67,17 +64,8 @@ public:
     rdb_namespace_access_t(uuid_u id, env_t *env);
     rdb_namespace_interface_t get_namespace_if();
 private:
-    base_namespace_repo_t<rdb_protocol_t>::access_t internal_;
-    env_t *env_;
+    base_namespace_repo_t::access_t internal_;
 };
-
-// This is a more selective subset of the list at the top of protocol.cc.
-typedef rdb_protocol_t::read_t read_t;
-typedef rdb_protocol_t::sindex_rangespec_t sindex_rangespec_t;
-typedef rdb_protocol_t::rget_read_t rget_read_t;
-typedef rdb_protocol_t::read_response_t read_response_t;
-typedef rdb_protocol_t::rget_read_response_t rget_read_response_t;
-typedef rdb_protocol_t::region_t region_t;
 
 class scope_env_t;
 class datum_stream_t : public single_threaded_countable_t<datum_stream_t>,
@@ -85,10 +73,10 @@ class datum_stream_t : public single_threaded_countable_t<datum_stream_t>,
 public:
     virtual ~datum_stream_t() { }
 
-    virtual counted_t<datum_stream_t> add_transformation(
-        env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt) = 0;
-    counted_t<datum_stream_t> add_grouping(
-        env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt);
+    virtual void add_transformation(transform_variant_t &&tv,
+                                    const protob_t<const Backtrace> &bt) = 0;
+    void add_grouping(transform_variant_t &&tv,
+                      const protob_t<const Backtrace> &bt);
 
     counted_t<val_t> run_terminal(env_t *env, const terminal_variant_t &tv);
     counted_t<val_t> to_array(env_t *env);
@@ -97,6 +85,7 @@ public:
     counted_t<datum_stream_t> slice(size_t l, size_t r);
     counted_t<datum_stream_t> zip();
     counted_t<datum_stream_t> indexes_of(counted_t<func_t> f);
+    counted_t<datum_stream_t> ordered_distinct();
 
     // Returns false or NULL respectively if stream is lazy.
     virtual bool is_array() = 0;
@@ -112,6 +101,7 @@ public:
     // Prefer `next_batch`.  Cannot be used in conjunction with `next_batch`.
     virtual counted_t<const datum_t> next(env_t *env, const batchspec_t &batchspec);
     virtual bool is_exhausted() const = 0;
+    virtual bool is_cfeed() const = 0;
 
     virtual void accumulate(
         env_t *env, eager_acc_t *acc, const terminal_variant_t &tv) = 0;
@@ -143,8 +133,8 @@ private:
 
     virtual bool is_array() = 0;
 
-    virtual counted_t<datum_stream_t> add_transformation(
-        env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt);
+    virtual void add_transformation(transform_variant_t &&tv,
+                                    const protob_t<const Backtrace> &bt);
     virtual void accumulate(env_t *env, eager_acc_t *acc, const terminal_variant_t &tv);
     virtual void accumulate_all(env_t *env, eager_acc_t *acc);
 
@@ -171,6 +161,9 @@ private:
     virtual bool is_exhausted() const {
         return source->is_exhausted() && batch_cache_exhausted();
     }
+    virtual bool is_cfeed() const {
+        return source->is_cfeed();
+    }
 
 protected:
     const counted_t<datum_stream_t> source;
@@ -188,11 +181,21 @@ private:
     int64_t index;
 };
 
+class ordered_distinct_datum_stream_t : public wrapper_datum_stream_t {
+public:
+    ordered_distinct_datum_stream_t(counted_t<datum_stream_t> _source);
+private:
+    std::vector<counted_t<const datum_t> >
+    next_raw_batch(env_t *env, const batchspec_t &batchspec);
+    counted_t<const datum_t> last_val;
+};
+
 class array_datum_stream_t : public eager_datum_stream_t {
 public:
     array_datum_stream_t(counted_t<const datum_t> _arr,
                          const protob_t<const Backtrace> &bt_src);
     virtual bool is_exhausted() const;
+    virtual bool is_cfeed() const;
 
 private:
     virtual bool is_array();
@@ -217,6 +220,7 @@ private:
     virtual std::vector<counted_t<const datum_t> >
     next_raw_batch(env_t *env, const batchspec_t &batchspec);
     virtual bool is_exhausted() const;
+    virtual bool is_cfeed() const;
     uint64_t index, left, right;
 };
 
@@ -252,16 +256,25 @@ class union_datum_stream_t : public datum_stream_t {
 public:
     union_datum_stream_t(std::vector<counted_t<datum_stream_t> > &&_streams,
                          const protob_t<const Backtrace> &bt_src)
-        : datum_stream_t(bt_src), streams(_streams), streams_index(0) { }
+        : datum_stream_t(bt_src), streams(_streams), streams_index(0),
+          is_cfeed_union(false) {
+        for (auto it = streams.begin(); it != streams.end(); ++it) {
+            if ((*it)->is_cfeed()) {
+                is_cfeed_union = true;
+                break;
+            }
+        }
+    }
 
-    virtual counted_t<datum_stream_t> add_transformation(
-        env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt);
+    virtual void add_transformation(transform_variant_t &&tv,
+                                    const protob_t<const Backtrace> &bt);
     virtual void accumulate(env_t *env, eager_acc_t *acc, const terminal_variant_t &tv);
     virtual void accumulate_all(env_t *env, eager_acc_t *acc);
 
     virtual bool is_array();
     virtual counted_t<const datum_t> as_array(env_t *env);
     virtual bool is_exhausted() const;
+    virtual bool is_cfeed() const;
 
 private:
     std::vector<counted_t<const datum_t> >
@@ -269,6 +282,7 @@ private:
 
     std::vector<counted_t<datum_stream_t> > streams;
     size_t streams_index;
+    bool is_cfeed_union;
 };
 
 // This class generates the `read_t`s used in range reads.  It's used by
@@ -278,6 +292,7 @@ class readgen_t {
 public:
     explicit readgen_t(
         const std::map<std::string, wire_func_t> &global_optargs,
+        std::string table_name,
         const datum_range_t &original_datum_range,
         profile_bool_t profile,
         sorting_t sorting);
@@ -312,6 +327,7 @@ public:
                       const store_key_t &last_key) const;
 protected:
     const std::map<std::string, wire_func_t> global_optargs;
+    const std::string table_name;
     const datum_range_t original_datum_range;
     const profile_bool_t profile;
     const sorting_t sorting;
@@ -327,11 +343,15 @@ class primary_readgen_t : public readgen_t {
 public:
     static scoped_ptr_t<readgen_t> make(
         env_t *env,
+        std::string table_name,
         datum_range_t range = datum_range_t::universe(),
         sorting_t sorting = sorting_t::UNORDERED);
 private:
     primary_readgen_t(const std::map<std::string, wire_func_t> &global_optargs,
-                      datum_range_t range, profile_bool_t profile, sorting_t sorting);
+                      std::string table_name,
+                      datum_range_t range,
+                      profile_bool_t profile,
+                      sorting_t sorting);
     virtual rget_read_t next_read_impl(
         const key_range_t &active_range,
         const std::vector<transform_variant_t> &transform,
@@ -350,14 +370,18 @@ class sindex_readgen_t : public readgen_t {
 public:
     static scoped_ptr_t<readgen_t> make(
         env_t *env,
+        std::string table_name,
         const std::string &sindex,
         datum_range_t range = datum_range_t::universe(),
         sorting_t sorting = sorting_t::UNORDERED);
 private:
     sindex_readgen_t(
         const std::map<std::string, wire_func_t> &global_optargs,
-        const std::string &sindex, datum_range_t sindex_range,
-        profile_bool_t profile, sorting_t sorting);
+        std::string table_name,
+        const std::string &sindex,
+        datum_range_t sindex_range,
+        profile_bool_t profile,
+        sorting_t sorting);
     virtual rget_read_t next_read_impl(
         const key_range_t &active_range,
         const std::vector<transform_variant_t> &transform,
@@ -419,12 +443,13 @@ public:
     }
 
     bool is_exhausted() const;
+    virtual bool is_cfeed() const;
 private:
     std::vector<counted_t<const datum_t> >
     next_batch_impl(env_t *env, const batchspec_t &batchspec);
 
-    virtual counted_t<datum_stream_t> add_transformation(
-        env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt);
+    virtual void add_transformation(transform_variant_t &&tv,
+                                    const protob_t<const Backtrace> &bt);
     virtual void accumulate(env_t *env, eager_acc_t *acc, const terminal_variant_t &tv);
     virtual void accumulate_all(env_t *env, eager_acc_t *acc);
 

@@ -2,8 +2,8 @@
 #include "arch/runtime/coroutines.hpp"
 #include "arch/timing.hpp"
 #include "buffer_cache/alt/page_cache.hpp"
-// For alt_memory_tracker_t.  KSI: We'll want a mock memory_tracker_t subclass.
 #include "buffer_cache/alt/alt.hpp"
+#include "buffer_cache/alt/cache_balancer.hpp"
 #include "concurrency/auto_drainer.hpp"
 #include "concurrency/pmap.hpp"
 #include "containers/scoped.hpp"
@@ -24,7 +24,7 @@ namespace unittest {
 struct mock_ser_t {
     mock_file_opener_t opener;
     scoped_ptr_t<standard_serializer_t> ser;
-    scoped_ptr_t<alt_memory_tracker_t> tracker;
+    scoped_ptr_t<alt_txn_throttler_t> throttler;
 
     mock_ser_t()
         : opener() {
@@ -33,44 +33,41 @@ struct mock_ser_t {
         ser = make_scoped<standard_serializer_t>(log_serializer_t::dynamic_config_t(),
                                                  &opener,
                                                  &get_global_perfmon_collection());
-        tracker = make_scoped<alt_memory_tracker_t>();
+        // We pass a high minimum unwritten changes limit so that the memory-limited
+        // BiggerTest tests don't throttle their write transactions (and hang).  (In
+        // real code you must not have a write transaction construction block the
+        // lifetime of another write transaction construction, but here in the unit
+        // tests we want to specifically run various combinations of such cases.)
+        throttler = make_scoped<alt_txn_throttler_t>(4000);
     }
 };
 
-void reset_tracker_acq(alt::tracker_acq_t *acq) {
-    alt::tracker_acq_t movee(std::move(*acq));
+void reset_throttler_acq(alt::throttler_acq_t *acq) {
+    alt::throttler_acq_t movee(std::move(*acq));
 }
 
 class test_txn_t;
 
 class test_cache_t : public page_cache_t {
 public:
-    test_cache_t(serializer_t *serializer, alt_memory_tracker_t *tracker)
-        : page_cache_t(serializer, page_cache_config_t(), tracker),
-          tracker_(tracker) { }
-    test_cache_t(serializer_t *serializer, alt_memory_tracker_t *tracker,
-                 uint64_t memory_limit)
-        : page_cache_t(serializer, make_config(memory_limit), tracker),
-          tracker_(tracker) { }
+    test_cache_t(serializer_t *serializer,
+                 cache_balancer_t *balancer,
+                 alt_txn_throttler_t *throttler)
+        : page_cache_t(serializer, balancer, throttler),
+          throttler_(throttler) { }
 
     void flush(scoped_ptr_t<test_txn_t> txn) {
-        flush_and_destroy_txn(std::move(txn), &reset_tracker_acq);
+        flush_and_destroy_txn(std::move(txn), &reset_throttler_acq);
     }
 
-    alt::tracker_acq_t make_tracker_acq() {
+    alt::throttler_acq_t make_throttler_acq() {
         // KSI: We could make these tests better by varying the expected change
         // count.
-        return tracker_->begin_txn_or_throttle(0);
+        return throttler_->begin_txn_or_throttle(0);
     }
 
 private:
-    static page_cache_config_t make_config(uint64_t memory_limit) {
-        page_cache_config_t ret;
-        ret.memory_limit = memory_limit;
-        return ret;
-    }
-
-    alt_memory_tracker_t *tracker_;
+    alt_txn_throttler_t *throttler_;
 };
 
 class test_txn_t : public page_txn_t {
@@ -122,7 +119,7 @@ test_txn_t::test_txn_t(test_cache_t *cache,
                        repli_timestamp_t recency)
     : page_txn_t(cache,
                  recency,
-                 cache->make_tracker_acq(),
+                 cache->make_throttler_acq(),
                  NULL) { }
 
 
@@ -132,19 +129,22 @@ TPTEST(PageTest, Control, 4) {
 
 TPTEST(PageTest, CreateDestroy, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
 }
 
 TPTEST(PageTest, OneTxn, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn = make_scoped<test_txn_t>(&page_cache);
     page_cache.flush(std::move(txn));
 }
 
 TPTEST(PageTest, TwoIndependentTxn, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn1 = make_scoped<test_txn_t>(&page_cache);
     auto txn2 = make_scoped<test_txn_t>(&page_cache);
     page_cache.flush(std::move(txn2));
@@ -153,7 +153,8 @@ TPTEST(PageTest, TwoIndependentTxn, 4) {
 
 TPTEST(PageTest, TwoIndependentTxnSwitch, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn1 = make_scoped<test_txn_t>(&page_cache);
     auto txn2 = make_scoped<test_txn_t>(&page_cache);
     page_cache.flush(std::move(txn1));
@@ -162,7 +163,8 @@ TPTEST(PageTest, TwoIndependentTxnSwitch, 4) {
 
 TPTEST(PageTest, TwoSequentialTxnSwitch, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn1 = make_scoped<test_txn_t>(&page_cache);
     auto txn2 = make_scoped<test_txn_t>(&page_cache);
     page_cache.flush(std::move(txn1));
@@ -171,7 +173,8 @@ TPTEST(PageTest, TwoSequentialTxnSwitch, 4) {
 
 TPTEST(PageTest, OneWriteAcq, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn = make_scoped<test_txn_t>(&page_cache);
     {
         current_test_acq_t acq(txn.get(), 0, access_t::write, page_create_t::yes);
@@ -182,7 +185,8 @@ TPTEST(PageTest, OneWriteAcq, 4) {
 
 TPTEST(PageTest, OneWriteAcqOneReadAcq, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn1 = make_scoped<test_txn_t>(&page_cache);
     {
         current_test_acq_t acq(txn1.get(), 0, access_t::write, page_create_t::yes);
@@ -200,7 +204,8 @@ TPTEST(PageTest, OneWriteAcqOneReadAcq, 4) {
 
 TPTEST(PageTest, OneWriteAcqWait, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     auto txn = make_scoped<test_txn_t>(&page_cache);
     {
         current_test_acq_t acq(txn.get(), alt_create_t::create);
@@ -258,7 +263,8 @@ void ReadAfterWrite_cases(ReadAfterWrite_state_t *s, test_cache_t *cache, int i)
 
 TPTEST(PageTest, ReadAfterWrite, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     ReadAfterWrite_state_t s;
     pmap(2, std::bind(&ReadAfterWrite_cases, &s, &page_cache, ph::_1));
 }
@@ -303,7 +309,8 @@ void WriteWaitForFlush_cases(WriteWaitForFlush_state_t *s, test_cache_t *cache, 
 
 TPTEST(PageTest, WriteWaitForFlush, 4) {
     mock_ser_t mock;
-    test_cache_t page_cache(mock.ser.get(), mock.tracker.get());
+    dummy_cache_balancer_t balancer(GIGABYTE);
+    test_cache_t page_cache(mock.ser.get(), &balancer, mock.throttler.get());
     WriteWaitForFlush_state_t s;
     pmap(2, std::bind(&WriteWaitForFlush_cases, &s, &page_cache, ph::_1));
 }
@@ -320,7 +327,8 @@ public:
 
     void run() {
         {
-            test_cache_t cache(mock.ser.get(), mock.tracker.get(), memory_limit);
+            dummy_cache_balancer_t balancer(memory_limit);
+            test_cache_t cache(mock.ser.get(), &balancer, mock.throttler.get());
             auto_drainer_t drain;
             c = &cache;
 
@@ -365,7 +373,8 @@ public:
         c = NULL;
 
         {
-            test_cache_t cache(mock.ser.get(), mock.tracker.get(), memory_limit);
+            dummy_cache_balancer_t balancer(memory_limit);
+            test_cache_t cache(mock.ser.get(), &balancer, mock.throttler.get());
             auto_drainer_t drain;
             c = &cache;
             coro_t::spawn_ordered(std::bind(&bigger_test_t::run_txn14,
@@ -376,7 +385,8 @@ public:
         c = NULL;
 
         {
-            test_cache_t cache(mock.ser.get(), mock.tracker.get(), memory_limit);
+            dummy_cache_balancer_t balancer(memory_limit);
+            test_cache_t cache(mock.ser.get(), &balancer, mock.throttler.get());
             c = &cache;
             auto txn = make_scoped<test_txn_t>(c);
 
@@ -980,12 +990,9 @@ private:
 
             condX2.wait();
 
-            // Thanks to predictable free list behavior, we expect this new block to have
-            // the same block id as the block id b[8], which was deleted by run_txn11
-            // just before condX2 got pulsed.
             auto acq8 = make_scoped<current_test_acq_t>(txn12.get(),
                                                         alt_create_t::create);
-            ASSERT_EQ(b[8], acq8->block_id());
+            b[8] = acq8->block_id();
             acq7.reset();
 
             make_empty(acq8);

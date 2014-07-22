@@ -16,6 +16,7 @@
 #include "concurrency/wait_any.hpp"
 #include "arch/timing.hpp"
 #include "http/json.hpp"
+#include "extproc/extproc_job.hpp"
 
 // Unique ids used to refer to objects on the JS side.
 typedef uint64_t js_id_t;
@@ -29,15 +30,6 @@ class extproc_pool_t;
 class js_runner_t;
 class js_job_t;
 class js_timeout_sentry_t;
-
-class js_worker_exc_t : public std::exception {
-public:
-    explicit js_worker_exc_t(const std::string& data) : info(data) { }
-    ~js_worker_exc_t() throw () { }
-    const char *what() const throw () { return info.c_str(); }
-private:
-    std::string info;
-};
 
 // A handle to a running "javascript evaluator" job.
 class js_runner_t : public home_thread_mixin_t {
@@ -54,6 +46,8 @@ public:
 
     void begin(extproc_pool_t *pool,
                signal_t *interruptor);
+
+    void end();
 
     // Evalute JS source string to either a value or a function ID to call later
     js_result_t eval(const std::string &source,

@@ -3,6 +3,7 @@
 #define BTREE_DEPTH_FIRST_TRAVERSAL_HPP_
 
 #include "btree/keys.hpp"
+#include "btree/types.hpp"
 #include "containers/archive/archive.hpp"
 #include "containers/counted.hpp"
 
@@ -45,10 +46,9 @@ private:
     DISABLE_COPYING(scoped_key_value_t);
 };
 
-enum class done_traversing_t { NO, YES };
 class depth_first_traversal_callback_t {
 public:
-    /* Return value of `true` indicates to keep going; `false` indicates to stop
+    /* Return value of `NO` indicates to keep going; `YES` indicates to stop
     traversing the tree. */
     virtual done_traversing_t handle_pair(scoped_key_value_t &&keyvalue) = 0;
     virtual profile::trace_t *get_trace() THROWS_NOTHING { return NULL; }
@@ -68,6 +68,8 @@ ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(direction_t, int8_t, FORWARD, BACKWARD);
 bool btree_depth_first_traversal(superblock_t *superblock,
                                  const key_range_t &range,
                                  depth_first_traversal_callback_t *cb,
-                                 direction_t direction);
+                                 direction_t direction,
+                                 release_superblock_t release_superblock
+                                     = release_superblock_t::RELEASE);
 
 #endif /* BTREE_DEPTH_FIRST_TRAVERSAL_HPP_ */

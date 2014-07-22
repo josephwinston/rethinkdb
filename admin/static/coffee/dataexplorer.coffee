@@ -89,7 +89,6 @@ module 'DataExplorerView', ->
         clear_history_view: (event) =>
             that = @
             @clear_history() # Delete from localstorage
-            @history_view.history = @history
 
             @history_view.clear_history event
 
@@ -316,6 +315,7 @@ module 'DataExplorerView', ->
             value: ['number', 'bool', 'string', 'array', 'object', 'time']
             any: ['number', 'bool', 'string', 'array', 'object', 'stream', 'selection', 'table', 'db', 'r', 'error' ]
             sequence: ['table', 'selection', 'stream', 'array']
+            grouped_stream: ['stream', 'array']
 
         # Convert meta types (value, any or sequence) to an array of types or return an array composed of just the type
         convert_type: (type) =>
@@ -384,6 +384,7 @@ module 'DataExplorerView', ->
             'next': true
             'collect': true
             'run': true
+            'EventEmitter\'s methods': true
 
         # Method called on the content of reql_docs.json
         # Load the suggestions in @suggestions, @map_state, @descriptions
@@ -910,11 +911,12 @@ module 'DataExplorerView', ->
 
                     if result.suggestions?.length > 0
                         for suggestion, i in result.suggestions
-                            result.suggestions.sort() # We could eventually sort things earlier with a merge sort but for now that should be enough
-                            @current_suggestions.push suggestion
-                            @.$('.suggestion_name_list').append @template_suggestion_name
-                                id: i
-                                suggestion: suggestion
+                            if suggestion isnt 'ungroup(' or @grouped_data is true # We add the suggestion for `ungroup` only if we are in a group_stream/data (using the flag @grouped_data)
+                                result.suggestions.sort() # We could eventually sort things earlier with a merge sort but for now that should be enough
+                                @current_suggestions.push suggestion
+                                @.$('.suggestion_name_list').append @template_suggestion_name
+                                    id: i
+                                    suggestion: suggestion
                     else if result.description?
                         @description = result.description
 
@@ -1258,12 +1260,15 @@ module 'DataExplorerView', ->
             @grouped_data = @count_group_level(stack).count_group > 0
 
             if result.suggestions?.length > 0
+                show_suggestion = false
                 for suggestion, i in result.suggestions
-                    @current_suggestions.push suggestion
-                    @.$('.suggestion_name_list').append @template_suggestion_name
-                        id: i
-                        suggestion: suggestion
-                if @state.options.suggestions is true
+                    if suggestion isnt 'ungroup(' or @grouped_data is true # We add the suggestion for `ungroup` only if we are in a group_stream/data (using the flag @grouped_data)
+                        show_suggestion = true
+                        @current_suggestions.push suggestion
+                        @.$('.suggestion_name_list').append @template_suggestion_name
+                            id: i
+                            suggestion: suggestion
+                if @state.options.suggestions is true and show_suggestion is true
                     @show_suggestion()
                 else
                     @hide_suggestion()
@@ -2364,6 +2369,11 @@ module 'DataExplorerView', ->
             @skip_value += @current_results.length
             try
                 @current_results = []
+
+                # If there are more results to show, we had to buffer one row, so we add that one extra row to the current results
+                @current_results.push @extra_row
+                @extra_row = undefined
+
                 @start_time = new Date()
 
                 @id_execution++
@@ -2505,6 +2515,7 @@ module 'DataExplorerView', ->
 
                     if error?
                         @toggle_executing false
+                        error.message = error.message.replace('Changefeeds not allowed on this connection', 'Changefeeds are not available in the data explorer')
                         if @queries.length > 1
                             @results_view.render_error(@raw_queries[@index-1], error)
                         else
@@ -2512,7 +2523,6 @@ module 'DataExplorerView', ->
                         @save_query
                             query: @raw_query
                             broken_query: true
-
                         return false
 
                     if results?.profile? and @state.last_query_has_profile is true
@@ -2526,12 +2536,9 @@ module 'DataExplorerView', ->
 
                     
                     if @index is @queries.length # @index was incremented in execute_portion
-                        if cursor?.hasNext?
+                        if cursor? and typeof cursor._next is 'function' # If the result is a cursor
                             @state.cursor = cursor
-                            if cursor.hasNext() is true
-                                @state.cursor.next get_result_callback
-                            else
-                                get_result_callback() # Display results
+                            @state.cursor.next get_result_callback
                         else
                             @toggle_executing false
 
@@ -2567,17 +2574,21 @@ module 'DataExplorerView', ->
             get_result_callback = (error, data) =>
                 if @id_execution is id_execution
                     if error?
-                        if @queries.length > 1
-                            @results_view.render_error(@query, error)
-                        else
-                            @results_view.render_error(null, error)
-                        return false
+                        if error.message isnt 'No more rows in the cursor.'
+                            if @queries.length > 1
+                                @results_view.render_error(@query, error)
+                            else
+                                @results_view.render_error(null, error)
+                            return false
 
                     if data isnt undefined
-                        @current_results.push data
-                        if @current_results.length < @limit and @state.cursor.hasNext() is true
+                        if @current_results.length < @limit # We display @limit results per page, if we don't have enough, we keep requesting more
+                            @current_results.push data
                             @state.cursor.next get_result_callback
-                            return true
+                        else if @current_results.length is @limit # If we've reached the limit of results we can show, we still want to know if there are more results available
+                            @extra_row = data # We requested an extra row, but won't display it on the current page, so we need to save it for later (when the user wants to show more results)
+                            get_result_callback() # Display results
+                        return true
 
                     @toggle_executing false
 
@@ -2589,7 +2600,7 @@ module 'DataExplorerView', ->
                         skip_value: @skip_value
                         execution_time: new Date() - @start_time
                         query: @query
-                        has_more_data: @state.cursor.hasNext()
+                        has_more_data: @extra_row isnt undefined # If we could buffer one more row, it means that there are more results available
 
                     @results_view.render_result
                         results: @current_results # The first parameter is null ( = query, so we don't display it)
@@ -2807,6 +2818,7 @@ module 'DataExplorerView', ->
     
     class @SharedResultView extends Backbone.View
         template_json_tree:
+            'large_container' : Handlebars.templates['dataexplorer_large_result_json_tree_container-template']
             'container' : Handlebars.templates['dataexplorer_result_json_tree_container-template']
             'span': Handlebars.templates['dataexplorer_result_json_tree_span-template']
             'span_with_quotes': Handlebars.templates['dataexplorer_result_json_tree_span_with_quotes-template']
@@ -2983,7 +2995,7 @@ module 'DataExplorerView', ->
                 if /^(http|https):\/\/[^\s]+$/i.test(value)
                     return @template_json_tree.url
                         url: value
-                else if /^[a-z0-9]+@[a-z0-9]+.[a-z0-9]{2,4}/i.test(value) # We don't handle .museum extension and special characters
+                else if /^[-0-9a-z.+_]+@[-0-9a-z.+_]+\.[a-z]{2,4}/i.test(value) # We don't handle .museum extension and special characters
                     return @template_json_tree.email
                         email: value
                 else
@@ -3126,8 +3138,14 @@ module 'DataExplorerView', ->
 
 
         json_to_tree: (result) =>
-            return @template_json_tree.container
-                tree: @json_to_node(result)
+            result_json = JSON.stringify(result, null, 4)
+            # If the results are too large, we just display the raw indented JSON to avoid freezing the interface
+            if result_json.length > @large_response_threshold
+                return @template_json_tree.large_container
+                    json_data: result_json
+            else
+                return @template_json_tree.container
+                    tree: @json_to_node(result)
 
         json_to_table_get_attr: (flatten_attr) =>
             return @template_json_table.tr_attr
@@ -3337,6 +3355,7 @@ module 'DataExplorerView', ->
         cursor_timed_out_template: Handlebars.templates['dataexplorer-cursor_timed_out-template']
         no_profile_template: Handlebars.templates['dataexplorer-no_profile-template']
         profile_header_template: Handlebars.templates['dataexplorer-profiler_header-template']
+        escape_template: Handlebars.templates['escape-template']
         primitive_key: '_-primitive value-_--' # We suppose that there is no key with such value in the database.
 
         events: ->
@@ -3344,6 +3363,7 @@ module 'DataExplorerView', ->
                 'click .activate_profiler': 'activate_profiler'
 
         current_result: []
+        large_response_threshold: 100000 # ~ 2000 uuids
 
         initialize: (args) =>
             @container = args.container
@@ -3544,7 +3564,7 @@ module 'DataExplorerView', ->
                                     @$('.value-'+expandable_columns[0]['col']).css 'max-width', current_size+max_size-20
                                 expandable_columns = []
                 when 'raw'
-                    @.$('.raw_view_textarea').html JSON.stringify @results
+                    @.$('.raw_view_textarea').html @escape_template(JSON.stringify(@results))
                     @$('.results').hide()
                     @$('.raw_view_container').show()
                     @expand_raw_textarea()
@@ -3751,7 +3771,7 @@ module 'DataExplorerView', ->
             that = @
             event.preventDefault()
             @container.clear_history()
-            @history = @container.history
+            @history = @container.state.history
 
             @$('.query_history').slideUp 'fast', ->
                 $(@).remove()

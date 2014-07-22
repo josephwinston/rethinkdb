@@ -1,6 +1,8 @@
 util = require('./util')
 err = require('./errors')
 net = require('./net')
+protoTermType = require('./proto-def').Term.TermType
+Promise = require('bluebird')
 
 # Import some names to this namespace for convienience
 ar = util.ar
@@ -56,18 +58,23 @@ class TermBase
     run: (connection, options, callback) ->
         # Valid syntaxes are
         # connection, callback
+        # connection, options # return a Promise
         # connection, options, callback
         # connection, null, callback
+        # connection, null # return a Promise
         # 
         # Depreciated syntaxes are
         # optionsWithConnection, callback
         
         if net.isConnection(connection) is true
             # Handle run(connection, callback)
-            if typeof options is "function"
-                callback = options
-                options = {}
-            # else we suppose that we have run(connection, options, callback)
+            if typeof options is "function" 
+                if callback is undefined
+                    callback = options
+                    options = {}
+                else
+                    throw new err.RqlDriverError "Second argument to `run` cannot be a function is a third argument is provided."
+            # else we suppose that we have run(connection[, options][, callback])
         else if connection?.constructor is Object
             if @showRunWarning is true
                 process?.stderr.write("RethinkDB warning: This syntax is deprecated. Please use `run(connection[, options], callback)`.")
@@ -78,7 +85,7 @@ class TermBase
             connection = connection.connection
             delete options["connection"]
 
-        options = {} if options is null
+        options = {} if not options?
 
         # Check if the arguments are valid types
         for own key of options
@@ -87,119 +94,140 @@ class TermBase
         if net.isConnection(connection) is false
             throw new err.RqlDriverError "First argument to `run` must be an open connection."
 
-        # We only require a callback if noreply isn't set
-        if not options.noreply and typeof(callback) isnt 'function'
-            throw new err.RqlDriverError "The last argument to `run` must be a callback to invoke "+
-                                         "with either an error or the result of the query."
+        if options.noreply is true or typeof callback is 'function'
+            try
+                connection._start @, callback, options
+            catch e
+                # It was decided that, if we can, we prefer to invoke the callback
+                # with any errors rather than throw them as normal exceptions.
+                # Thus we catch errors here and invoke the callback instead of
+                # letting the error bubble up.
+                if typeof(callback) is 'function'
+                    callback(e)
+        else
+            new Promise (resolve, reject) =>
+                callback = (err, result) ->
+                    if err?
+                        reject(err)
+                    else
+                        resolve(result)
 
-        try
-            connection._start @, callback, options
-        catch e
-            # It was decided that, if we can, we prefer to invoke the callback
-            # with any errors rather than throw them as normal exceptions.
-            # Thus we catch errors here and invoke the callback instead of
-            # letting the error bubble up.
-            if typeof(callback) is 'function'
-                callback(e)
-            else
-                throw e
+                try
+                    connection._start @, callback, options
+                catch e
+                    callback(e)
 
     toString: -> err.printQuery(@)
 
 class RDBVal extends TermBase
-    eq: varar(1, null, (others...) -> new Eq {}, @, others...)
-    ne: varar(1, null, (others...) -> new Ne {}, @, others...)
-    lt: varar(1, null, (others...) -> new Lt {}, @, others...)
-    le: varar(1, null, (others...) -> new Le {}, @, others...)
-    gt: varar(1, null, (others...) -> new Gt {}, @, others...)
-    ge: varar(1, null, (others...) -> new Ge {}, @, others...)
+    eq: (args...) -> new Eq {}, @, args...
+    ne: (args...) -> new Ne {}, @, args...
+    lt: (args...) -> new Lt {}, @, args...
+    le: (args...) -> new Le {}, @, args...
+    gt: (args...) -> new Gt {}, @, args...
+    ge: (args...) -> new Ge {}, @, args...
 
-    not: ar () -> new Not {}, @
+    not: (args...) -> new Not {}, @, args...
 
-    add: varar(1, null, (others...) -> new Add {}, @, others...)
-    sub: varar(1, null, (others...) -> new Sub {}, @, others...)
-    mul: varar(1, null, (others...) -> new Mul {}, @, others...)
-    div: varar(1, null, (others...) -> new Div {}, @, others...)
-    mod: ar (other) -> new Mod {}, @, other
+    add: (args...) -> new Add {}, @, args...
+    sub: (args...) -> new Sub {}, @, args...
+    mul: (args...) -> new Mul {}, @, args...
+    div: (args...) -> new Div {}, @, args...
+    mod: (args...) -> new Mod {}, @, args...
 
-    append: ar (val) -> new Append {}, @, val
-    prepend: ar (val) -> new Prepend {}, @, val
-    difference: ar (val) -> new Difference {}, @, val
-    setInsert: ar (val) -> new SetInsert {}, @, val
-    setUnion: ar (val) -> new SetUnion {}, @, val
-    setIntersection: ar (val) -> new SetIntersection {}, @, val
-    setDifference: ar (val) -> new SetDifference {}, @, val
-    slice: aropt (left, right, opts) -> new Slice opts, @, left, right
-    skip: ar (index) -> new Skip {}, @, index
-    limit: ar (index) -> new Limit {}, @, index
-    getField: ar (field) -> new GetField {}, @, field
-    contains: varar(1, null, (fields...) -> new Contains {}, @, fields.map(funcWrap)...)
-    insertAt: ar (index, value) -> new InsertAt {}, @, index, value
-    spliceAt: ar (index, value) -> new SpliceAt {}, @, index, value
-    deleteAt: varar(1, 2, (others...) -> new DeleteAt {}, @, others...)
-    changeAt: ar (index, value) -> new ChangeAt {}, @, index, value
-    indexesOf: ar (which) -> new IndexesOf {}, @, funcWrap(which)
-    hasFields: varar(0, null, (fields...) -> new HasFields {}, @, fields...)
-    withFields: varar(0, null, (fields...) -> new WithFields {}, @, fields...)
-    keys: ar(-> new Keys {}, @)
+    append: (args...) -> new Append {}, @, args...
+    prepend: (args...) -> new Prepend {}, @, args...
+    difference: (args...) -> new Difference {}, @, args...
+    setInsert: (args...) -> new SetInsert {}, @, args...
+    setUnion: (args...) -> new SetUnion {}, @, args...
+    setIntersection: (args...) -> new SetIntersection {}, @, args...
+    setDifference: (args...) -> new SetDifference {}, @, args...
+    slice: varar(1, 3, (left, right_or_opts, opts) ->
+        if opts?
+            new Slice opts, @, left, right_or_opts
+        else if typeof right_or_opts isnt 'undefined'
+            # FIXME
+            if (Object::toString.call(right_or_opts) is '[object Object]') and not (right_or_opts instanceof TermBase)
+                new Slice right_or_opts, @, left
+            else
+                new Slice {}, @, left, right_or_opts
+        else
+            new Slice {}, @, left
+        )
+    skip: (args...) -> new Skip {}, @, args...
+    limit: (args...) -> new Limit {}, @, args...
+    getField: (args...) -> new GetField {}, @, args...
+    contains: (args...) -> new Contains {}, @, args...
+    insertAt: (args...) -> new InsertAt {}, @, args...
+    spliceAt: (args...) -> new SpliceAt {}, @, args...
+    deleteAt: (args...) -> new DeleteAt {}, @, args...
+    changeAt: (args...) -> new ChangeAt {}, @, args...
+    indexesOf: (args...) -> new IndexesOf {}, @, args.map(funcWrap)...
+    hasFields: (args...) -> new HasFields {}, @, args...
+    withFields: (args...) -> new WithFields {}, @, args...
+    keys: (args...) -> new Keys {}, @, args...
+    changes: (args...) -> new Changes {}, @, args...
 
     # pluck and without on zero fields are allowed
-    pluck: (fields...) -> new Pluck {}, @, fields...
-    without: (fields...) -> new Without {}, @, fields...
+    pluck: (args...) -> new Pluck {}, @, args...
+    without: (args...) -> new Without {}, @, args...
 
-    merge: varar(1, null, (fields...) -> new Merge {}, @, fields.map(funcWrap)...)
+    merge: (args...) -> new Merge {}, @, args.map(funcWrap)...
     between: aropt (left, right, opts) -> new Between opts, @, left, right
-    reduce: varar(1, 2, (func) -> new Reduce {}, @, funcWrap(func))
-    map: ar (func) -> new Map {}, @, funcWrap(func)
+    reduce: (args...) -> new Reduce {}, @, args.map(funcWrap)...
+    map: (args...) -> new Map {}, @, args.map(funcWrap)...
     filter: aropt (predicate, opts) -> new Filter opts, @, funcWrap(predicate)
-    concatMap: ar (func) -> new ConcatMap {}, @, funcWrap(func)
-    distinct: ar () -> new Distinct {}, @
-    count: varar(0, 1, (fun...) -> new Count {}, @, fun.map(funcWrap)...)
-    union: varar(1, null, (others...) -> new Union {}, @, others...)
-    nth: ar (index) -> new Nth {}, @, index
-    match: ar (pattern) -> new Match {}, @, pattern
-    split: varar(0, null, (fields...) -> new Split {}, @, fields.map(funcWrap)...)
-    upcase: ar () -> new Upcase {}, @
-    downcase: ar () -> new Downcase {}, @
-    isEmpty: ar () -> new IsEmpty {}, @
-    innerJoin: ar (other, predicate) -> new InnerJoin {}, @, other, predicate
-    outerJoin: ar (other, predicate) -> new OuterJoin {}, @, other, predicate
+    concatMap: (args...) -> new ConcatMap {}, @, args.map(funcWrap)...
+    distinct: aropt (opts) -> new Distinct opts, @
+    count: (args...) -> new Count {}, @, args.map(funcWrap)...
+    union: (args...) -> new Union {}, @, args...
+    nth: (args...) -> new Nth {}, @, args...
+    match: (args...) -> new Match {}, @, args...
+    split: (args...) -> new Split {}, @, args.map(funcWrap)...
+    upcase: (args...) -> new Upcase {}, @, args...
+    downcase: (args...) -> new Downcase {}, @, args...
+    isEmpty: (args...) -> new IsEmpty {}, @, args...
+    innerJoin: (args...) -> new InnerJoin {}, @, args...
+    outerJoin: (args...) -> new OuterJoin {}, @, args...
     eqJoin: aropt (left_attr, right, opts) -> new EqJoin opts, @, funcWrap(left_attr), right
-    zip: ar () -> new Zip {}, @
-    coerceTo: ar (type) -> new CoerceTo {}, @, type
-    ungroup: ar () -> new Ungroup {}, @
-    typeOf: ar () -> new TypeOf {}, @
+    zip: (args...) -> new Zip {}, @, args...
+    coerceTo: (args...) -> new CoerceTo {}, @, args...
+    ungroup: (args...) -> new Ungroup {}, @, args...
+    typeOf: (args...) -> new TypeOf {}, @, args...
     update: aropt (func, opts) -> new Update opts, @, funcWrap(func)
     delete: aropt (opts) -> new Delete opts, @
     replace: aropt (func, opts) -> new Replace opts, @, funcWrap(func)
-    do: ar (func) -> new FunCall {}, funcWrap(func), @
-    default: ar (x) -> new Default {}, @, x
+    do: (args...) ->
+        new FunCall {}, funcWrap(args[-1..][0]), @, args[...-1]...
 
-    or: varar(1, null, (others...) -> new Any {}, @, others...)
-    and: varar(1, null, (others...) -> new All {}, @, others...)
+    default: (args...) -> new Default {}, @, args...
 
-    forEach: ar (func) -> new ForEach {}, @, funcWrap(func)
+    or: (args...) -> new Any {}, @, args...
+    and: (args...) -> new All {}, @, args...
 
-    sum: varar(0, null, (fields...) -> new Sum {}, @, fields.map(funcWrap)...)
-    avg: varar(0, null, (fields...) -> new Avg {}, @, fields.map(funcWrap)...)
-    min: varar(0, null, (fields...) -> new Min {}, @, fields.map(funcWrap)...)
-    max: varar(0, null, (fields...) -> new Max {}, @, fields.map(funcWrap)...)
+    forEach: (args...) -> new ForEach {}, @, args.map(funcWrap)...
 
-    info: ar () -> new Info {}, @
-    sample: ar (count) -> new Sample {}, @, count
+    sum: (args...) -> new Sum {}, @, args.map(funcWrap)...
+    avg: (args...) -> new Avg {}, @, args.map(funcWrap)...
+    min: (args...) -> new Min {}, @, args.map(funcWrap)...
+    max: (args...) -> new Max {}, @, args.map(funcWrap)...
 
+    info: (args...) -> new Info {}, @, args...
+    sample: (args...) -> new Sample {}, @, args...
+    
     group: (fieldsAndOpts...) ->
         # Default if no opts dict provided
         opts = {}
         fields = fieldsAndOpts
 
         # Look for opts dict
-        perhapsOptDict = fieldsAndOpts[fieldsAndOpts.length - 1]
-        if perhapsOptDict and
-                (Object::toString.call(perhapsOptDict) is '[object Object]') and
-                not (perhapsOptDict instanceof TermBase)
-            opts = perhapsOptDict
-            fields = fieldsAndOpts[0...(fieldsAndOpts.length - 1)]
+        if fieldsAndOpts.length > 0
+            perhapsOptDict = fieldsAndOpts[fieldsAndOpts.length - 1]
+            if perhapsOptDict and
+                    (Object::toString.call(perhapsOptDict) is '[object Object]') and
+                    not (perhapsOptDict instanceof TermBase)
+                opts = perhapsOptDict
+                fields = fieldsAndOpts[0...(fieldsAndOpts.length - 1)]
 
         new Group opts, @, fields.map(funcWrap)...
 
@@ -228,14 +256,14 @@ class RDBVal extends TermBase
     # Database operations
 
     tableCreate: aropt (tblName, opts) -> new TableCreate opts, @, tblName
-    tableDrop: ar (tblName) -> new TableDrop {}, @, tblName
-    tableList: ar(-> new TableList {}, @)
+    tableDrop: (args...) -> new TableDrop {}, @, args...
+    tableList: (args...) -> new TableList {}, @, args...
 
     table: aropt (tblName, opts) -> new Table opts, @, tblName
 
     # Table operations
 
-    get: ar (key) -> new Get {}, @, key
+    get: (args...) -> new Get {}, @, args...
 
     getAll: (keysAndOpts...) ->
         # Default if no opts dict provided
@@ -243,23 +271,21 @@ class RDBVal extends TermBase
         keys = keysAndOpts
 
         # Look for opts dict
-        perhapsOptDict = keysAndOpts[keysAndOpts.length - 1]
-        if perhapsOptDict and
-                ((Object::toString.call(perhapsOptDict) is '[object Object]') and not (perhapsOptDict instanceof TermBase))
-            opts = perhapsOptDict
-            keys = keysAndOpts[0...(keysAndOpts.length - 1)]
+        if keysAndOpts.length > 1
+            perhapsOptDict = keysAndOpts[keysAndOpts.length - 1]
+            if perhapsOptDict and
+                    ((Object::toString.call(perhapsOptDict) is '[object Object]') and not (perhapsOptDict instanceof TermBase))
+                opts = perhapsOptDict
+                keys = keysAndOpts[0...(keysAndOpts.length - 1)]
 
         new GetAll opts, @, keys...
 
-    # For this function only use `exprJSON` rather than letting it default to regular
-    # `expr`. This will attempt to serialize as much of the document as JSON as possible.
-    # This behavior can be manually overridden with either direct JSON serialization
-    # or ReQL datum serialization by first wrapping the argument with `r.expr` or `r.json`.
-    insert: aropt (doc, opts) -> new Insert opts, @, rethinkdb.exprJSON(doc)
+    insert: aropt (doc, opts) -> new Insert opts, @, rethinkdb.expr(doc)
     indexCreate: varar(1, 3, (name, defun_or_opts, opts) ->
         if opts?
             new IndexCreate opts, @, name, funcWrap(defun_or_opts)
         else if defun_or_opts?
+            # FIXME?
             if (Object::toString.call(defun_or_opts) is '[object Object]') and not (defun_or_opts instanceof Function) and not (defun_or_opts instanceof TermBase)
                 new IndexCreate defun_or_opts, @, name
             else
@@ -267,29 +293,30 @@ class RDBVal extends TermBase
         else
             new IndexCreate {}, @, name
         )
-    indexDrop: ar (name) -> new IndexDrop {}, @, name
-    indexList: ar () -> new IndexList {}, @
-    indexStatus: varar(0, null, (others...) -> new IndexStatus {}, @, others...)
-    indexWait: varar(0, null, (others...) -> new IndexWait {}, @, others...)
 
-    sync: ar () -> new Sync {}, @
+    indexDrop: (args...) -> new IndexDrop {}, @, args...
+    indexList: (args...) -> new IndexList {}, @, args...
+    indexStatus: (args...) -> new IndexStatus {}, @, args...
+    indexWait: (args...) -> new IndexWait {}, @, args...
 
-    toISO8601: ar () -> new ToISO8601 {}, @
-    toEpochTime: ar () -> new ToEpochTime {}, @
-    inTimezone: ar (tzstr) -> new InTimezone {}, @, tzstr
+    sync: (args...) -> new Sync {}, @, args...
+
+    toISO8601: (args...) -> new ToISO8601 {}, @, args...
+    toEpochTime: (args...) -> new ToEpochTime {}, @, args...
+    inTimezone: (args...) -> new InTimezone {}, @, args...
     during: aropt (t2, t3, opts) -> new During opts, @, t2, t3
-    date: ar () -> new RQLDate {}, @
-    timeOfDay: ar () -> new TimeOfDay {}, @
-    timezone: ar () -> new Timezone {}, @
+    date: (args...) -> new RQLDate {}, @, args...
+    timeOfDay: (args...) -> new TimeOfDay {}, @, args...
+    timezone: (args...) -> new Timezone {}, @, args...
 
-    year: ar () -> new Year {}, @
-    month: ar () -> new Month {}, @
-    day: ar () -> new Day {}, @
-    dayOfWeek: ar () -> new DayOfWeek {}, @
-    dayOfYear: ar () -> new DayOfYear {}, @
-    hours: ar () -> new Hours {}, @
-    minutes: ar () -> new Minutes {}, @
-    seconds: ar () -> new Seconds {}, @
+    year: (args...) -> new Year {}, @, args...
+    month: (args...) -> new Month {}, @, args...
+    day: (args...) -> new Day {}, @, args...
+    dayOfWeek: (args...) -> new DayOfWeek {}, @, args...
+    dayOfYear: (args...) -> new DayOfYear {}, @, args...
+    hours: (args...) -> new Hours {}, @, args...
+    minutes: (args...) -> new Minutes {}, @, args...
+    seconds: (args...) -> new Seconds {}, @, args...
 
 class DatumTerm extends RDBVal
     args: []
@@ -308,26 +335,10 @@ class DatumTerm extends RDBVal
                 ''+@data
 
     build: ->
-        datum = {}
-        if @data is null
-            datum.type = "R_NULL"
-        else
-            switch typeof @data
-                when 'number'
-                    datum.type = "R_NUM"
-                    datum.r_num = @data
-                when 'boolean'
-                    datum.type = "R_BOOL"
-                    datum.r_bool = @data
-                when 'string'
-                    datum.type = "R_STR"
-                    datum.r_str = @data
-                else
-                    throw new err.RqlDriverError "Cannot convert `#{@data}` to Datum."
-        term =
-            type: "DATUM"
-            datum: datum
-        return term
+        if typeof(@data) is 'number'
+            if !isFinite(@data)
+                throw new TypeError("Illegal non-finite number `" + @data.toString() + "`.")
+        @data
 
 translateBackOptargs = (optargs) ->
     result = {}
@@ -337,10 +348,11 @@ translateBackOptargs = (optargs) ->
             when 'return_vals' then 'returnVals'
             when 'use_outdated' then 'useOutdated'
             when 'non_atomic' then 'nonAtomic'
-            when 'cache_size' then 'cacheSize'
             when 'left_bound' then 'leftBound'
             when 'right_bound' then 'rightBound'
             when 'default_timezone' then 'defaultTimezone'
+            when 'result_format' then 'resultFormat'
+            when 'page_limit' then 'pageLimit'
             else key
 
         result[key] = val
@@ -355,10 +367,11 @@ translateOptargs = (optargs) ->
             when 'returnVals' then 'return_vals'
             when 'useOutdated' then 'use_outdated'
             when 'nonAtomic' then 'non_atomic'
-            when 'cacheSize' then 'cache_size'
             when 'leftBound' then 'left_bound'
             when 'rightBound' then 'right_bound'
             when 'defaultTimezone' then 'default_timezone'
+            when 'resultFormat' then 'result_format'
+            when 'pageLimit' then 'page_limit'
             else key
 
         if key is undefined or val is undefined then continue
@@ -378,16 +391,20 @@ class RDBOp extends RDBVal
         return self
 
     build: ->
-        term = {args:[], optargs:[]}
-        term.type = @tt
+        res = [@tt, []]
         for arg in @args
-            term.args.push(arg.build())
+            res[1].push(arg.build())
+
+        opts = {}
+        add_opts = false
+
         for own key,val of @optargs
-            pair =
-                key: key
-                val: val.build()
-            term.optargs.push(pair)
-        return term
+            add_opts = true
+            opts[key] = val.build()
+
+        if add_opts
+            res.push(opts)
+        res
 
     compose: (args, optargs) ->
         if @st
@@ -421,52 +438,70 @@ shouldWrap = (arg) ->
     arg instanceof DatumTerm or arg instanceof MakeArray or arg instanceof MakeObject
 
 class MakeArray extends RDBOp
-    tt: "MAKE_ARRAY"
+    tt: protoTermType.MAKE_ARRAY
     st: '[...]' # This is only used by the `undefined` argument checker
 
     compose: (args) -> ['[', intsp(args), ']']
 
 class MakeObject extends RDBOp
-    tt: "MAKE_OBJ"
+    tt: protoTermType.MAKE_OBJECT
     st: '{...}' # This is only used by the `undefined` argument checker
 
-    constructor: (obj) ->
+    constructor: (obj, nestingDepth=20) ->
         self = super({})
         self.optargs = {}
         for own key,val of obj
             if typeof val is 'undefined'
                 throw new err.RqlDriverError "Object field '#{key}' may not be undefined"
-            self.optargs[key] = rethinkdb.expr val
+            self.optargs[key] = rethinkdb.expr val, nestingDepth-1
         return self
 
     compose: (args, optargs) -> kved(optargs)
 
+    build: ->
+        res = {}
+        for own key,val of @optargs
+            res[key] = val.build()
+        return res
+
 class Var extends RDBOp
-    tt: "VAR"
-    compose: (args) -> ['var_'+args[0]]
+    tt: protoTermType.VAR
+    compose: (args) -> ['var_'+args]
 
 class JavaScript extends RDBOp
-    tt: "JAVASCRIPT"
+    tt: protoTermType.JAVASCRIPT
     st: 'js'
 
+class Http extends RDBOp
+    tt: protoTermType.HTTP
+    st: 'http'
+
 class Json extends RDBOp
-    tt: "JSON"
+    tt: protoTermType.JSON
     st: 'json'
 
+class Args extends RDBOp
+    tt: protoTermType.ARGS
+    st: 'args'
+
 class UserError extends RDBOp
-    tt: "ERROR"
+    tt: protoTermType.ERROR
     st: 'error'
 
+class Random extends RDBOp
+    tt: protoTermType.RANDOM
+    st: 'random'
+
 class ImplicitVar extends RDBOp
-    tt: "IMPLICIT_VAR"
+    tt: protoTermType.IMPLICIT_VAR
     compose: -> ['r.row']
 
 class Db extends RDBOp
-    tt: "DB"
+    tt: protoTermType.DB
     st: 'db'
 
 class Table extends RDBOp
-    tt: "TABLE"
+    tt: protoTermType.TABLE
     st: 'table'
 
     compose: (args, optargs) ->
@@ -476,345 +511,350 @@ class Table extends RDBOp
             ['r.table(', intspallargs(args, optargs), ')']
 
 class Get extends RDBOp
-    tt: "GET"
+    tt: protoTermType.GET
     mt: 'get'
 
 class GetAll extends RDBOp
-    tt: "GET_ALL"
+    tt: protoTermType.GET_ALL
     mt: 'getAll'
 
 class Eq extends RDBOp
-    tt: "EQ"
+    tt: protoTermType.EQ
     mt: 'eq'
 
 class Ne extends RDBOp
-    tt: "NE"
+    tt: protoTermType.NE
     mt: 'ne'
 
 class Lt extends RDBOp
-    tt: "LT"
+    tt: protoTermType.LT
     mt: 'lt'
 
 class Le extends RDBOp
-    tt: "LE"
+    tt: protoTermType.LE
     mt: 'le'
 
 class Gt extends RDBOp
-    tt: "GT"
+    tt: protoTermType.GT
     mt: 'gt'
 
 class Ge extends RDBOp
-    tt: "GE"
+    tt: protoTermType.GE
     mt: 'ge'
 
 class Not extends RDBOp
-    tt: "NOT"
+    tt: protoTermType.NOT
     mt: 'not'
 
 class Add extends RDBOp
-    tt: "ADD"
+    tt: protoTermType.ADD
     mt: 'add'
 
 class Sub extends RDBOp
-    tt: "SUB"
+    tt: protoTermType.SUB
     mt: 'sub'
 
 class Mul extends RDBOp
-    tt: "MUL"
+    tt: protoTermType.MUL
     mt: 'mul'
 
 class Div extends RDBOp
-    tt: "DIV"
+    tt: protoTermType.DIV
     mt: 'div'
 
 class Mod extends RDBOp
-    tt: "MOD"
+    tt: protoTermType.MOD
     mt: 'mod'
 
 class Append extends RDBOp
-    tt: "APPEND"
+    tt: protoTermType.APPEND
     mt: 'append'
 
 class Prepend extends RDBOp
-    tt: "PREPEND"
+    tt: protoTermType.PREPEND
     mt: 'prepend'
 
 class Difference extends RDBOp
-    tt: "DIFFERENCE"
+    tt: protoTermType.DIFFERENCE
     mt: 'difference'
 
 class SetInsert extends RDBOp
-    tt: "SET_INSERT"
+    tt: protoTermType.SET_INSERT
     mt: 'setInsert'
 
 class SetUnion extends RDBOp
-    tt: "SET_UNION"
+    tt: protoTermType.SET_UNION
     mt: 'setUnion'
 
 class SetIntersection extends RDBOp
-    tt: "SET_INTERSECTION"
+    tt: protoTermType.SET_INTERSECTION
     mt: 'setIntersection'
 
 class SetDifference extends RDBOp
-    tt: "SET_DIFFERENCE"
+    tt: protoTermType.SET_DIFFERENCE
     mt: 'setDifference'
 
 class Slice extends RDBOp
-    tt: "SLICE"
+    tt: protoTermType.SLICE
     mt: 'slice'
 
 class Skip extends RDBOp
-    tt: "SKIP"
+    tt: protoTermType.SKIP
     mt: 'skip'
 
 class Limit extends RDBOp
-    tt: "LIMIT"
+    tt: protoTermType.LIMIT
     mt: 'limit'
 
 class GetField extends RDBOp
-    tt: "GET_FIELD"
+    tt: protoTermType.GET_FIELD
     st: '(...)' # This is only used by the `undefined` argument checker
 
     compose: (args) -> [args[0], '(', args[1], ')']
 
 class Contains extends RDBOp
-    tt: "CONTAINS"
+    tt: protoTermType.CONTAINS
     mt: 'contains'
 
 class InsertAt extends RDBOp
-    tt: "INSERT_AT"
+    tt: protoTermType.INSERT_AT
     mt: 'insertAt'
 
 class SpliceAt extends RDBOp
-    tt: "SPLICE_AT"
+    tt: protoTermType.SPLICE_AT
     mt: 'spliceAt'
 
 class DeleteAt extends RDBOp
-    tt: "DELETE_AT"
+    tt: protoTermType.DELETE_AT
     mt: 'deleteAt'
 
 class ChangeAt extends RDBOp
-    tt: "CHANGE_AT"
+    tt: protoTermType.CHANGE_AT
     mt: 'changeAt'
 
 class Contains extends RDBOp
-    tt: "CONTAINS"
+    tt: protoTermType.CONTAINS
     mt: 'contains'
 
 class HasFields extends RDBOp
-    tt: "HAS_FIELDS"
+    tt: protoTermType.HAS_FIELDS
     mt: 'hasFields'
 
 class WithFields extends RDBOp
-    tt: "WITH_FIELDS"
+    tt: protoTermType.WITH_FIELDS
     mt: 'withFields'
 
 class Keys extends RDBOp
-    tt: "KEYS"
+    tt: protoTermType.KEYS
     mt: 'keys'
 
+class Changes extends RDBOp
+    tt: protoTermType.CHANGES
+    mt: 'changes'
+
+
 class Object_ extends RDBOp
-    tt: "OBJECT"
+    tt: protoTermType.OBJECT
     mt: 'object'
 
 class Pluck extends RDBOp
-    tt: "PLUCK"
+    tt: protoTermType.PLUCK
     mt: 'pluck'
 
 class IndexesOf extends RDBOp
-    tt: "INDEXES_OF"
+    tt: protoTermType.INDEXES_OF
     mt: 'indexesOf'
 
 class Without extends RDBOp
-    tt: "WITHOUT"
+    tt: protoTermType.WITHOUT
     mt: 'without'
 
 class Merge extends RDBOp
-    tt: "MERGE"
+    tt: protoTermType.MERGE
     mt: 'merge'
 
 class Between extends RDBOp
-    tt: "BETWEEN"
+    tt: protoTermType.BETWEEN
     mt: 'between'
 
 class Reduce extends RDBOp
-    tt: "REDUCE"
+    tt: protoTermType.REDUCE
     mt: 'reduce'
 
 class Map extends RDBOp
-    tt: "MAP"
+    tt: protoTermType.MAP
     mt: 'map'
 
 class Filter extends RDBOp
-    tt: "FILTER"
+    tt: protoTermType.FILTER
     mt: 'filter'
 
 class ConcatMap extends RDBOp
-    tt: "CONCATMAP"
+    tt: protoTermType.CONCATMAP
     mt: 'concatMap'
 
 class OrderBy extends RDBOp
-    tt: "ORDERBY"
+    tt: protoTermType.ORDERBY
     mt: 'orderBy'
 
 class Distinct extends RDBOp
-    tt: "DISTINCT"
+    tt: protoTermType.DISTINCT
     mt: 'distinct'
 
 class Count extends RDBOp
-    tt: "COUNT"
+    tt: protoTermType.COUNT
     mt: 'count'
 
 class Union extends RDBOp
-    tt: "UNION"
+    tt: protoTermType.UNION
     mt: 'union'
 
 class Nth extends RDBOp
-    tt: "NTH"
+    tt: protoTermType.NTH
     mt: 'nth'
 
 class Match extends RDBOp
-    tt: "MATCH"
+    tt: protoTermType.MATCH
     mt: 'match'
 
 class Split extends RDBOp
-    tt: "SPLIT"
+    tt: protoTermType.SPLIT
     mt: 'split'
 
 class Upcase extends RDBOp
-    tt: "UPCASE"
+    tt: protoTermType.UPCASE
     mt: 'upcase'
 
 class Downcase extends RDBOp
-    tt: "DOWNCASE"
+    tt: protoTermType.DOWNCASE
     mt: 'downcase'
 
 class IsEmpty extends RDBOp
-    tt: "IS_EMPTY"
+    tt: protoTermType.IS_EMPTY
     mt: 'isEmpty'
 
 class Group extends RDBOp
-    tt: "GROUP"
+    tt: protoTermType.GROUP
     mt: 'group'
 
 class Sum extends RDBOp
-    tt: "SUM"
+    tt: protoTermType.SUM
     mt: 'sum'
 
 class Avg extends RDBOp
-    tt: "AVG"
+    tt: protoTermType.AVG
     mt: 'avg'
 
 class Min extends RDBOp
-    tt: "MIN"
+    tt: protoTermType.MIN
     mt: 'min'
 
 class Max extends RDBOp
-    tt: "MAX"
+    tt: protoTermType.MAX
     mt: 'max'
 
 class InnerJoin extends RDBOp
-    tt: "INNER_JOIN"
+    tt: protoTermType.INNER_JOIN
     mt: 'innerJoin'
 
 class OuterJoin extends RDBOp
-    tt: "OUTER_JOIN"
+    tt: protoTermType.OUTER_JOIN
     mt: 'outerJoin'
 
 class EqJoin extends RDBOp
-    tt: "EQ_JOIN"
+    tt: protoTermType.EQ_JOIN
     mt: 'eqJoin'
 
 class Zip extends RDBOp
-    tt: "ZIP"
+    tt: protoTermType.ZIP
     mt: 'zip'
 
 class CoerceTo extends RDBOp
-    tt: "COERCE_TO"
+    tt: protoTermType.COERCE_TO
     mt: 'coerceTo'
 
 class Ungroup extends RDBOp
-    tt: "UNGROUP"
+    tt: protoTermType.UNGROUP
     mt: 'ungroup'
 
 class TypeOf extends RDBOp
-    tt: "TYPEOF"
+    tt: protoTermType.TYPEOF
     mt: 'typeOf'
 
 class Info extends RDBOp
-    tt: "INFO"
+    tt: protoTermType.INFO
     mt: 'info'
 
 class Sample extends RDBOp
-    tt: "SAMPLE"
+    tt: protoTermType.SAMPLE
     mt: 'sample'
 
 class Update extends RDBOp
-    tt: "UPDATE"
+    tt: protoTermType.UPDATE
     mt: 'update'
 
 class Delete extends RDBOp
-    tt: "DELETE"
+    tt: protoTermType.DELETE
     mt: 'delete'
 
 class Replace extends RDBOp
-    tt: "REPLACE"
+    tt: protoTermType.REPLACE
     mt: 'replace'
 
 class Insert extends RDBOp
-    tt: "INSERT"
+    tt: protoTermType.INSERT
     mt: 'insert'
 
 class DbCreate extends RDBOp
-    tt: "DB_CREATE"
+    tt: protoTermType.DB_CREATE
     st: 'dbCreate'
 
 class DbDrop extends RDBOp
-    tt: "DB_DROP"
+    tt: protoTermType.DB_DROP
     st: 'dbDrop'
 
 class DbList extends RDBOp
-    tt: "DB_LIST"
+    tt: protoTermType.DB_LIST
     st: 'dbList'
 
 class TableCreate extends RDBOp
-    tt: "TABLE_CREATE"
+    tt: protoTermType.TABLE_CREATE
     mt: 'tableCreate'
 
 class TableDrop extends RDBOp
-    tt: "TABLE_DROP"
+    tt: protoTermType.TABLE_DROP
     mt: 'tableDrop'
 
 class TableList extends RDBOp
-    tt: "TABLE_LIST"
+    tt: protoTermType.TABLE_LIST
     mt: 'tableList'
 
 class IndexCreate extends RDBOp
-    tt: "INDEX_CREATE"
+    tt: protoTermType.INDEX_CREATE
     mt: 'indexCreate'
 
 class IndexDrop extends RDBOp
-    tt: "INDEX_DROP"
+    tt: protoTermType.INDEX_DROP
     mt: 'indexDrop'
 
 class IndexList extends RDBOp
-    tt: "INDEX_LIST"
+    tt: protoTermType.INDEX_LIST
     mt: 'indexList'
 
 class IndexStatus extends RDBOp
-    tt: "INDEX_STATUS"
+    tt: protoTermType.INDEX_STATUS
     mt: 'indexStatus'
 
 class IndexWait extends RDBOp
-    tt: "INDEX_WAIT"
+    tt: protoTermType.INDEX_WAIT
     mt: 'indexWait'
 
 class Sync extends RDBOp
-    tt: "SYNC"
+    tt: protoTermType.SYNC
     mt: 'sync'
 
 class FunCall extends RDBOp
-    tt: "FUNCALL"
+    tt: protoTermType.FUNCALL
     st: 'do' # This is only used by the `undefined` argument checker
 
     compose: (args) ->
@@ -826,27 +866,27 @@ class FunCall extends RDBOp
             [args[1], '.do(', args[0], ')']
 
 class Default extends RDBOp
-    tt: "DEFAULT"
+    tt: protoTermType.DEFAULT
     mt: 'default'
 
 class Branch extends RDBOp
-    tt: "BRANCH"
+    tt: protoTermType.BRANCH
     st: 'branch'
 
 class Any extends RDBOp
-    tt: "ANY"
+    tt: protoTermType.ANY
     mt: 'or'
 
 class All extends RDBOp
-    tt: "ALL"
+    tt: protoTermType.ALL
     mt: 'and'
 
 class ForEach extends RDBOp
-    tt: "FOREACH"
+    tt: protoTermType.FOREACH
     mt: 'forEach'
 
 class Func extends RDBOp
-    tt: "FUNC"
+    tt: protoTermType.FUNC
     @nextVarId: 0
 
     constructor: (optargs, func) ->
@@ -879,91 +919,91 @@ class Func extends RDBOp
             ['function(', varStr, ') { return ', args[1], '; }']
 
 class Asc extends RDBOp
-    tt: "ASC"
+    tt: protoTermType.ASC
     st: 'asc'
 
 class Desc extends RDBOp
-    tt: "DESC"
+    tt: protoTermType.DESC
     st: 'desc'
 
 class Literal extends RDBOp
-    tt: "LITERAL"
+    tt: protoTermType.LITERAL
     st: 'literal'
 
 class ISO8601 extends RDBOp
-    tt: 'ISO8601'
+    tt: protoTermType.ISO8601
     st: 'ISO8601'
 
 class ToISO8601 extends RDBOp
-    tt: 'TO_ISO8601'
+    tt: protoTermType.TO_ISO8601
     mt: 'toISO8601'
 
 class EpochTime extends RDBOp
-    tt: 'EPOCH_TIME'
+    tt: protoTermType.EPOCH_TIME
     st: 'epochTime'
 
 class ToEpochTime extends RDBOp
-    tt: 'TO_EPOCH_TIME'
+    tt: protoTermType.TO_EPOCH_TIME
     mt: 'toEpochTime'
 
 class Now extends RDBOp
-    tt: 'NOW'
+    tt: protoTermType.NOW
     st: 'now'
 
 class InTimezone extends RDBOp
-    tt: 'IN_TIMEZONE'
+    tt: protoTermType.IN_TIMEZONE
     mt: 'inTimezone'
 
 class During extends RDBOp
-    tt: 'DURING'
+    tt: protoTermType.DURING
     mt: 'during'
 
 class RQLDate extends RDBOp
-    tt: 'DATE'
+    tt: protoTermType.DATE
     mt: 'date'
 
 class TimeOfDay extends RDBOp
-    tt: 'TIME_OF_DAY'
+    tt: protoTermType.TIME_OF_DAY
     mt: 'timeOfDay'
 
 class Timezone extends RDBOp
-    tt: 'TIMEZONE'
+    tt: protoTermType.TIMEZONE
     mt: 'timezone'
 
 class Year extends RDBOp
-    tt: 'YEAR'
+    tt: protoTermType.YEAR
     mt: 'year'
 
 class Month extends RDBOp
-    tt: 'MONTH'
+    tt: protoTermType.MONTH
     mt: 'month'
 
 class Day extends RDBOp
-    tt: 'DAY'
+    tt: protoTermType.DAY
     mt: 'day'
 
 class DayOfWeek extends RDBOp
-    tt: 'DAY_OF_WEEK'
+    tt: protoTermType.DAY_OF_WEEK
     mt: 'dayOfWeek'
 
 class DayOfYear extends RDBOp
-    tt: 'DAY_OF_YEAR'
+    tt: protoTermType.DAY_OF_YEAR
     mt: 'dayOfYear'
 
 class Hours extends RDBOp
-    tt: 'HOURS'
+    tt: protoTermType.HOURS
     mt: 'hours'
 
 class Minutes extends RDBOp
-    tt: 'MINUTES'
+    tt: protoTermType.MINUTES
     mt: 'minutes'
 
 class Seconds extends RDBOp
-    tt: 'SECONDS'
+    tt: protoTermType.SECONDS
     mt: 'seconds'
 
 class Time extends RDBOp
-    tt: 'TIME'
+    tt: protoTermType.TIME
     st: 'time'
 
 # All top level exported functions
@@ -976,6 +1016,9 @@ rethinkdb.expr = varar 1, 2, (val, nestingDepth=20) ->
     if nestingDepth <= 0
         throw new err.RqlDriverError "Nesting depth limit exceeded"
 
+    if typeof nestingDepth isnt "number" or isNaN(nestingDepth)
+        throw new err.RqlDriverError "Second argument to `r.expr` must be a number or undefined."
+
     else if val instanceof TermBase
         val
     else if val instanceof Function
@@ -985,135 +1028,108 @@ rethinkdb.expr = varar 1, 2, (val, nestingDepth=20) ->
     else if Array.isArray val
         val = (rethinkdb.expr(v, nestingDepth - 1) for v in val)
         new MakeArray {}, val...
-    else if val == Object(val)
-        obj = {}
-        for own k,v of val
-            if typeof v is 'undefined'
-                throw new err.RqlDriverError "Object field '#{k}' may not be undefined"
-            obj[k] = rethinkdb.expr(v, nestingDepth - 1)
-        new MakeObject obj
+    else if typeof(val) is 'number'
+        new DatumTerm val
+    else if Object::toString.call(val) is '[object Object]'
+        new MakeObject val, nestingDepth
     else
         new DatumTerm val
 
-# Use r.json to serialize as much of the obect as JSON as is
-# feasible to avoid doing too much protobuf serialization.
-rethinkdb.exprJSON = varar 1, 2, (val, nestingDepth=20) ->
-    if nestingDepth <= 0
-        throw new err.RqlDriverError "Nesting depth limit exceeded"
-
-    if isJSON(val, nestingDepth - 1)
-        rethinkdb.json(JSON.stringify(val))
-    else if (val instanceof TermBase)
-        val
-    else if (val instanceof Date)
-        rethinkdb.expr(val)
-    else
-        if Array.isArray(val)
-            wrapped = []
-        else
-            wrapped = {}
-
-        for k,v of val
-            wrapped[k] = rethinkdb.exprJSON(v, nestingDepth - 1)
-        rethinkdb.expr(wrapped, nestingDepth - 1)
-
-# Is this JS value representable as JSON?
-isJSON = (val, nestingDepth=20) ->
-    if nestingDepth <= 0
-        throw new err.RqlDriverError "Nesting depth limit exceeded"
-
-    if (val instanceof TermBase)
-        false
-    else if (val instanceof Function)
-        false
-    else if (val instanceof Date)
-        false
-    else if (val instanceof Object)
-        # Covers array case as well
-        for own k,v of val
-            if not isJSON(v, nestingDepth - 1) then return false
-        true
-    else
-        # Primitive types can always be represented as JSON
-        true
-
 rethinkdb.js = aropt (jssrc, opts) -> new JavaScript opts, jssrc
 
-rethinkdb.json = ar (jsonsrc) -> new Json {}, jsonsrc
+rethinkdb.http = aropt (url, opts) -> new Http opts, url
 
-rethinkdb.error = varar 0, 1, (args...) -> new UserError {}, args...
+rethinkdb.json = (args...) -> new Json {}, args...
+
+rethinkdb.error = (args...) -> new UserError {}, args...
+
+rethinkdb.random = (limitsAndOpts...) ->
+        # Default if no opts dict provided
+        opts = {}
+        limits = limitsAndOpts
+
+        # Look for opts dict
+        perhapsOptDict = limitsAndOpts[limitsAndOpts.length - 1]
+        if perhapsOptDict and
+                ((Object::toString.call(perhapsOptDict) is '[object Object]') and not (perhapsOptDict instanceof TermBase))
+            opts = perhapsOptDict
+            limits = limitsAndOpts[0...(limitsAndOpts.length - 1)]
+
+        new Random opts, limits...
 
 rethinkdb.row = new ImplicitVar {}
 
 rethinkdb.table = aropt (tblName, opts) -> new Table opts, tblName
 
-rethinkdb.db = ar (dbName) -> new Db {}, dbName
+rethinkdb.db = (args...) -> new Db {}, args...
 
-rethinkdb.dbCreate = ar (dbName) -> new DbCreate {}, dbName
-rethinkdb.dbDrop = ar (dbName) -> new DbDrop {}, dbName
-rethinkdb.dbList = ar () -> new DbList {}
+rethinkdb.dbCreate = (args...) -> new DbCreate {}, args...
+rethinkdb.dbDrop = (args...) -> new DbDrop {}, args...
+rethinkdb.dbList = (args...) -> new DbList {}, args...
 
 rethinkdb.tableCreate = aropt (tblName, opts) -> new TableCreate opts, tblName
-rethinkdb.tableDrop = ar (tblName) -> new TableDrop {}, tblName
-rethinkdb.tableList = ar () -> new TableList {}
+rethinkdb.tableDrop = (args...) -> new TableDrop {}, args...
+rethinkdb.tableList = (args...) -> new TableList {}, args...
 
 rethinkdb.do = varar 1, null, (args...) ->
     new FunCall {}, funcWrap(args[-1..][0]), args[...-1]...
 
-rethinkdb.branch = ar (test, trueBranch, falseBranch) -> new Branch {}, test, trueBranch, falseBranch
+rethinkdb.branch = (args...) -> new Branch {}, args...
 
-rethinkdb.asc = (attr) -> new Asc {}, funcWrap(attr)
-rethinkdb.desc = (attr) -> new Desc {}, funcWrap(attr)
+rethinkdb.asc = (args...) -> new Asc {}, args.map(funcWrap)...
+rethinkdb.desc = (args...) -> new Desc {}, args.map(funcWrap)...
 
-rethinkdb.eq = varar 2, null, (args...) -> new Eq {}, args...
-rethinkdb.ne = varar 2, null, (args...) -> new Ne {}, args...
-rethinkdb.lt = varar 2, null, (args...) -> new Lt {}, args...
-rethinkdb.le = varar 2, null, (args...) -> new Le {}, args...
-rethinkdb.gt = varar 2, null, (args...) -> new Gt {}, args...
-rethinkdb.ge = varar 2, null, (args...) -> new Ge {}, args...
-rethinkdb.or = varar 2, null, (args...) -> new Any {}, args...
-rethinkdb.and = varar 2, null, (args...) -> new All {}, args...
+rethinkdb.eq = (args...) -> new Eq {}, args...
+rethinkdb.ne = (args...) -> new Ne {}, args...
+rethinkdb.lt = (args...) -> new Lt {}, args...
+rethinkdb.le = (args...) -> new Le {}, args...
+rethinkdb.gt = (args...) -> new Gt {}, args...
+rethinkdb.ge = (args...) -> new Ge {}, args...
+rethinkdb.or = (args...) -> new Any {}, args...
+rethinkdb.and = (args...) -> new All {}, args...
 
-rethinkdb.not = ar (x) -> new Not {}, x
+rethinkdb.not = (args...) -> new Not {}, args...
 
-rethinkdb.add = varar 2, null, (args...) -> new Add {}, args...
-rethinkdb.sub = varar 2, null, (args...) -> new Sub {}, args...
-rethinkdb.mul = varar 2, null, (args...) -> new Mul {}, args...
-rethinkdb.div = varar 2, null, (args...) -> new Div {}, args...
-rethinkdb.mod = ar (a, b) -> new Mod {}, a, b
+rethinkdb.add = (args...) -> new Add {}, args...
+rethinkdb.sub = (args...) -> new Sub {}, args...
+rethinkdb.div = (args...) -> new Div {}, args...
+rethinkdb.mul = (args...) -> new Mul {}, args...
+rethinkdb.mod = (args...) -> new Mod {}, args...
 
-rethinkdb.typeOf = ar (val) -> new TypeOf {}, val
-rethinkdb.info = ar (val) -> new Info {}, val
+rethinkdb.typeOf = (args...) -> new TypeOf {}, args...
+rethinkdb.info = (args...) -> new Info {}, args...
 
-rethinkdb.literal = varar 0, 1, (args...) -> new Literal {}, args...
+rethinkdb.literal = (args...) -> new Literal {}, args...
 
 rethinkdb.ISO8601 = aropt (str, opts) -> new ISO8601 opts, str
-rethinkdb.epochTime = ar (num) -> new EpochTime {}, num
-rethinkdb.now = ar () -> new Now {}
-rethinkdb.time = varar 3, 7, (args...) -> new Time {}, args...
+rethinkdb.epochTime = (args...) -> new EpochTime {}, args...
+rethinkdb.now = (args...) -> new Now {}, args...
+rethinkdb.time = (args...) -> new Time {}, args...
 
-rethinkdb.monday = new (class extends RDBOp then tt: 'MONDAY')()
-rethinkdb.tuesday = new (class extends RDBOp then tt: 'TUESDAY')()
-rethinkdb.wednesday = new (class extends RDBOp then tt: 'WEDNESDAY')()
-rethinkdb.thursday = new (class extends RDBOp then tt: 'THURSDAY')()
-rethinkdb.friday = new (class extends RDBOp then tt: 'FRIDAY')()
-rethinkdb.saturday = new (class extends RDBOp then tt: 'SATURDAY')()
-rethinkdb.sunday = new (class extends RDBOp then tt: 'SUNDAY')()
+rethinkdb.monday = new (class extends RDBOp then tt: protoTermType.MONDAY)()
+rethinkdb.tuesday = new (class extends RDBOp then tt: protoTermType.TUESDAY)()
+rethinkdb.wednesday = new (class extends RDBOp then tt: protoTermType.WEDNESDAY)()
+rethinkdb.thursday = new (class extends RDBOp then tt: protoTermType.THURSDAY)()
+rethinkdb.friday = new (class extends RDBOp then tt: protoTermType.FRIDAY)()
+rethinkdb.saturday = new (class extends RDBOp then tt: protoTermType.SATURDAY)()
+rethinkdb.sunday = new (class extends RDBOp then tt: protoTermType.SUNDAY)()
 
-rethinkdb.january = new (class extends RDBOp then tt: 'JANUARY')()
-rethinkdb.february = new (class extends RDBOp then tt: 'FEBRUARY')()
-rethinkdb.march = new (class extends RDBOp then tt: 'MARCH')()
-rethinkdb.april = new (class extends RDBOp then tt: 'APRIL')()
-rethinkdb.may = new (class extends RDBOp then tt: 'MAY')()
-rethinkdb.june = new (class extends RDBOp then tt: 'JUNE')()
-rethinkdb.july = new (class extends RDBOp then tt: 'JULY')()
-rethinkdb.august = new (class extends RDBOp then tt: 'AUGUST')()
-rethinkdb.september = new (class extends RDBOp then tt: 'SEPTEMBER')()
-rethinkdb.october = new (class extends RDBOp then tt: 'OCTOBER')()
-rethinkdb.november = new (class extends RDBOp then tt: 'NOVEMBER')()
-rethinkdb.december = new (class extends RDBOp then tt: 'DECEMBER')()
+rethinkdb.january = new (class extends RDBOp then tt: protoTermType.JANUARY)()
+rethinkdb.february = new (class extends RDBOp then tt: protoTermType.FEBRUARY)()
+rethinkdb.march = new (class extends RDBOp then tt: protoTermType.MARCH)()
+rethinkdb.april = new (class extends RDBOp then tt: protoTermType.APRIL)()
+rethinkdb.may = new (class extends RDBOp then tt: protoTermType.MAY)()
+rethinkdb.june = new (class extends RDBOp then tt: protoTermType.JUNE)()
+rethinkdb.july = new (class extends RDBOp then tt: protoTermType.JULY)()
+rethinkdb.august = new (class extends RDBOp then tt: protoTermType.AUGUST)()
+rethinkdb.september = new (class extends RDBOp then tt: protoTermType.SEPTEMBER)()
+rethinkdb.october = new (class extends RDBOp then tt: protoTermType.OCTOBER)()
+rethinkdb.november = new (class extends RDBOp then tt: protoTermType.NOVEMBER)()
+rethinkdb.december = new (class extends RDBOp then tt: protoTermType.DECEMBER)()
 
-rethinkdb.object = varar 0, null, (args...) -> new Object_ {}, args...
+rethinkdb.object = (args...) -> new Object_ {}, args...
+
+rethinkdb.args = (args...) -> new Args {}, args...
 
 # Export all names defined on rethinkdb
 module.exports = rethinkdb

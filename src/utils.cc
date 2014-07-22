@@ -244,8 +244,19 @@ int rng_t::randint(int n) {
     return x % n;
 }
 
+uint64_t rng_t::randuint64(uint64_t n) {
+    uint32_t x_low = jrand48(xsubi);  // NOLINT(runtime/int)
+    uint32_t x_high = jrand48(xsubi);  // NOLINT(runtime/int)
+    uint64_t x = x_high;
+    x <<= 32;
+    x += x_low;
+    return x % n;
+}
+
 double rng_t::randdouble() {
-    return erand48(xsubi);
+    uint64_t x = rng_t::randuint64(1LL << 53);
+    double res = x;
+    return res / (1LL << 53);
 }
 
 struct nrand_xsubi_t {
@@ -276,6 +287,24 @@ int randint(int n) {
     return x % n;
 }
 
+uint64_t randuint64(uint64_t n) {
+    nrand_xsubi_t buffer;
+    if (!TLS_get_rng_initialized()) {
+        CT_ASSERT(sizeof(buffer.xsubi) == 6);
+        get_dev_urandom(&buffer.xsubi, sizeof(buffer.xsubi));
+        TLS_set_rng_initialized(true);
+    } else {
+        buffer = TLS_get_rng_data();
+    }
+    uint32_t x_low = jrand48(buffer.xsubi);  // NOLINT(runtime/int)
+    uint32_t x_high = jrand48(buffer.xsubi);  // NOLINT(runtime/int)
+    uint64_t x = x_high;
+    x <<= 32;
+    x += x_low;
+    TLS_set_rng_data(buffer);
+    return x % n;
+}
+
 size_t randsize(size_t n) {
     size_t ret = 0;
     size_t i = SIZE_MAX;
@@ -288,17 +317,9 @@ size_t randsize(size_t n) {
 }
 
 double randdouble() {
-    nrand_xsubi_t buffer;
-    if (!TLS_get_rng_initialized()) {
-        CT_ASSERT(sizeof(buffer.xsubi) == 6);
-        get_dev_urandom(&buffer.xsubi, sizeof(buffer.xsubi));
-        TLS_set_rng_initialized(true);
-    } else {
-        buffer = TLS_get_rng_data();
-    }
-    double x = erand48(buffer.xsubi);  // NOLINT(runtime/int)
-    TLS_set_rng_data(buffer);
-    return x;
+    uint64_t x = randuint64(1LL << 53);
+    double res = x;
+    return res / (1LL << 53);
 }
 
 std::string rand_string(int len) {
@@ -529,7 +550,7 @@ void recreate_temporary_directory(const base_path_t& base_path) {
 
     // Call fsync() on the parent directory to guarantee that the newly
     // created directory's directory entry is persisted to disk.
-    guarantee_fsync_parent_directory(path.c_str());
+    warn_fsync_parent_directory(path.c_str());
 }
 
 bool ptr_in_byte_range(const void *p, const void *range_start, size_t size_in_bytes) {

@@ -27,18 +27,20 @@ public:
 
     threadnum_t home_thread() { return watchable_thread; }
 
+    template <class Callable>
+    void apply_read(Callable &&read) {
+        ASSERT_NO_CORO_WAITING;
+        const value_t *const_value = &value;
+        read(const_value);
+    }
+
 private:
     friend class cross_thread_watcher_subscription_t;
     void on_value_changed();
     void deliver(value_t new_value);
 
-    static void call(const boost::function<void()> &f) {
+    static void call(const std::function<void()> &f) {
         f();
-    }
-
-    void apply_read(const std::function<void(const value_t*)> &read) {
-        ASSERT_NO_CORO_WAITING;
-        read(const_cast<const value_t *>(&value));
     }
 
     class w_t : public watchable_t<value_t> {
@@ -54,7 +56,7 @@ private:
         void apply_read(const std::function<void(const value_t*)> &read) {
             return parent->apply_read(read);
         }
-        publisher_t<boost::function<void()> > *get_publisher() {
+        publisher_t<std::function<void()> > *get_publisher() {
             return parent->publisher_controller.get_publisher();
         }
         rwi_lock_assertion_t *get_rwi_lock_assertion() {
@@ -67,7 +69,7 @@ private:
     };
 
     clone_ptr_t<watchable_t<value_t> > original;
-    publisher_controller_t<boost::function<void()> > publisher_controller;
+    publisher_controller_t<std::function<void()> > publisher_controller;
     rwi_lock_assertion_t rwi_lock_assertion;
     value_t value;
     w_t watchable;
@@ -104,7 +106,7 @@ private:
     typename watchable_t<value_t>::subscription_t subs;
 
     single_value_producer_t<value_t> value_producer;
-    boost_function_callback_t<value_t> deliver_cb;
+    std_function_callback_t<value_t> deliver_cb;
     coro_pool_t<value_t> messanger_pool;
 
     DISABLE_COPYING(cross_thread_watchable_variable_t);

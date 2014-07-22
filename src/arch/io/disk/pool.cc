@@ -2,6 +2,7 @@
 #include "arch/io/disk/pool.hpp"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include "arch/io/disk.hpp"
 #include "config/args.hpp"
 #include "containers/printf_buffer.hpp"
+#include "logger.hpp"
 
 int blocker_pool_queue_depth(int max_concurrent_io_requests) {
     guarantee(max_concurrent_io_requests > 0);
@@ -26,7 +28,7 @@ void debug_print(printf_buffer_t *buf,
                  action.get_fd(),
                  action.get_count(),
                  action.get_offset(),
-                 action.get_succeeded() ? 0 : action.get_errno());
+                 action.get_succeeded() ? 0 : action.get_io_errno());
 }
 
 pool_diskmgr_t::pool_diskmgr_t(linux_event_queue_t *queue,
@@ -54,8 +56,24 @@ void pool_diskmgr_t::action_t::run() {
         }
     }
 
-    ssize_t sum = 0;
-    {
+    switch (type) {
+    case ACTION_RESIZE: {
+        CT_ASSERT(sizeof(off_t) == sizeof(int64_t));
+        int res;
+        do {
+            res = ftruncate(fd, offset);
+        } while (res == -1 && get_errno() == EINTR);
+        if (res == 0) {
+            io_result = 0;
+        } else {
+            io_result = -get_errno();
+            return;
+        }
+    } break;
+    case ACTION_READ:
+    case ACTION_WRITE: {
+        ssize_t sum = 0;
+
         iovec *vecs;
         size_t vecs_len;
         get_bufs(&vecs, &vecs_len);
@@ -69,9 +87,10 @@ void pool_diskmgr_t::action_t::run() {
             len = std::min(vecs_increment, vecs_len - i);
             ssize_t res;
             do {
-                if (is_read) {
+                if (type == ACTION_READ) {
                     res = preadv(fd, vecs + i, len, partial_offset);
                 } else {
+                    rassert(type == ACTION_WRITE);
                     res = pwritev(fd, vecs + i, len, partial_offset);
                 }
             } while (res == -1 && get_errno() == EINTR);
@@ -85,6 +104,17 @@ void pool_diskmgr_t::action_t::run() {
             for (size_t j = i; j < i + len; ++j) {
                 lensum += vecs[j].iov_len;
             }
+            if (lensum != res && type == ACTION_WRITE) {
+                // This happens when running out of disk space.
+                // The errno in that case is 0 and doesn't tell us about the
+                // real reason for the failed i/o.
+                // We set the io_result to be -ENOSPC and print an error stating
+                // what actually happened.
+                io_result = -ENOSPC;
+                logERR("Failed I/O: lensum (%" PRIi64 ") != res (%zd)."
+                       " Assuming we ran out of disk space.", lensum, res);
+                return;
+            }
             guarantee(lensum == res);
 
             partial_offset += lensum;
@@ -94,9 +124,10 @@ void pool_diskmgr_t::action_t::run() {
         guarantee(vecs_len == 1);
         ssize_t res;
         do {
-            if (is_read) {
+            if (type == ACTION_READ) {
                 res = pread(fd, vecs[0].iov_base, vecs[0].iov_len, offset);
             } else {
+                rassert(type == ACTION_WRITE);
                 res = pwrite(fd, vecs[0].iov_base, vecs[0].iov_len, offset);
             }
         } while (res == -1 && get_errno() == EINTR);
@@ -108,9 +139,12 @@ void pool_diskmgr_t::action_t::run() {
 
         sum = res;
 #endif  // USE_WRITEV
-    }
 
-    io_result = sum;
+        io_result = sum;
+    } break;
+    default:
+        unreachable("Unknown I/O action");
+    }
 
     if (wrap_in_datasyncs) {
         int errcode = perform_datasync(fd);

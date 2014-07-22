@@ -5,6 +5,8 @@
 #include <utility>
 
 #include "containers/archive/archive.hpp"
+#include "containers/archive/versioned.hpp"
+#include "rdb_protocol/datum.hpp"
 #include "rpc/serialize_macros.hpp"
 #include "time.hpp"
 
@@ -36,12 +38,11 @@ ARCHIVE_PRIM_MAKE_RANGED_SERIALIZABLE(
 
 class batcher_t {
 public:
-    template<class T>
-    bool note_el(const T &t) {
+    bool note_el(const counted_t<const datum_t> &t) {
         seen_one_el = true;
         els_left -= 1;
         min_els_left -= 1;
-        size_left -= serialized_size(t);
+        size_left -= serialized_size<cluster_version_t::CLUSTER>(t);
         return should_send_batch();
     }
     bool should_send_batch() const;
@@ -52,6 +53,11 @@ public:
         els_left(std::move(other.els_left)),
         size_left(std::move(other.size_left)),
         end_time(std::move(other.end_time)) { }
+    microtime_t microtime_left() {
+        microtime_t cur_time = current_microtime();
+        return end_time > cur_time ? end_time - cur_time : 0;
+    }
+    batch_type_t get_batch_type() { return batch_type; }
 private:
     DISABLE_COPYING(batcher_t);
     friend class batchspec_t;
@@ -76,19 +82,24 @@ public:
     batchspec_t with_at_most(uint64_t max_els) const;
     batchspec_t scale_down(int64_t divisor) const;
     batcher_t to_batcher() const;
-    RDB_MAKE_ME_SERIALIZABLE_6(batch_type, min_els, max_els, max_size, \
-                               first_scaledown_factor, end_time);
+
 private:
+    template<cluster_version_t W>
+    friend void serialize(write_message_t *, const batchspec_t &);
+    template<cluster_version_t W>
+    friend archive_result_t deserialize(read_stream_t *, batchspec_t *);
     // I made this private and accessible through a static function because it
     // was being accidentally default-initialized.
     batchspec_t() { } // USE ONLY FOR SERIALIZATION
     batchspec_t(batch_type_t batch_type, int64_t min_els, int64_t max_els,
-                int64_t max_size, int64_t first_scaledown, microtime_t end);
+                int64_t max_size, int64_t first_scaledown,
+                int64_t max_dur, microtime_t start_time);
 
     batch_type_t batch_type;
-    int64_t min_els, max_els, max_size, first_scaledown_factor;
-    microtime_t end_time;
+    int64_t min_els, max_els, max_size, first_scaledown_factor, max_dur;
+    microtime_t start_time;
 };
+RDB_DECLARE_SERIALIZABLE(batchspec_t);
 
 // TODO: make user-tunable.
 size_t array_size_limit();

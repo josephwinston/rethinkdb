@@ -2,28 +2,29 @@
 # Tests the driver API for making connections and excercizes the networking code
 ###
 
-import random
 import socket
 import threading
 import SocketServer
 import datetime
-from sys import argv
-from subprocess import Popen
+import sys
 from time import sleep, time
-from sys import path, exit
+import os
 import unittest
-path.insert(0, '.')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir))
 import test_util
-path.insert(0, "../../drivers/python")
 
-# We import the module both ways because this used to crash and we
-# need to test for it
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, "common"))
+import utils
+sys.path.insert(0, os.path.join(utils.project_root_dir(), 'drivers', 'python'))
+
+# We import the module both ways because this used to crash and we need to test for it
 from rethinkdb import *
 import rethinkdb as r
 
-server_build_dir = argv[1]
-use_default_port = bool(int(argv[2]))
-
+server_build_dir = sys.argv[1]
+use_default_port = 0
+if len(sys.argv) > 2:
+    use_default_port = bool(int(sys.argv[2]))
 
 class TestNoConnection(unittest.TestCase):
     # No servers started yet so this should fail
@@ -52,20 +53,23 @@ class TestNoConnection(unittest.TestCase):
             r.connect, host="0.0.0.0", port=11221)
 
     def test_empty_run(self):
-        # Test the error message when we pass nothing to run and
-        # didn't call `repl`
+        # Test the error message when we pass nothing to run and didn't call `repl`
         self.assertRaisesRegexp(
             r.RqlDriverError, "RqlQuery.run must be given a connection to run on.",
             r.expr(1).run)
 
     def test_auth_key(self):
         # Test that everything still doesn't work even with an auth key
+        if not use_default_port:
+            self.skipTest("Not testing default port")
         self.assertRaisesRegexp(
-            RqlDriverError, "Could not connect to 0.0.0.0:28015.",
+            RqlDriverError, 'Could not connect to 0.0.0.0:28015."',
             r.connect, host="0.0.0.0", port=28015, auth_key="hunter2")
 
 class TestConnectionDefaultPort(unittest.TestCase):
-
+    
+    servers = None
+    
     def setUp(self):
         if not use_default_port:
             self.skipTest("Not testing default port")
@@ -73,7 +77,8 @@ class TestConnectionDefaultPort(unittest.TestCase):
         self.servers.__enter__()
 
     def tearDown(self):
-        self.default_server.__exit__(None, None, None)
+        if self.servers is not None:
+            self.servers.__exit__(None, None, None)
 
     def test_connect(self):
         conn = r.connect()
@@ -93,7 +98,7 @@ class TestConnectionDefaultPort(unittest.TestCase):
 
     def test_connect_wrong_auth(self):
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, auth_key="hunter2")
 
 class BlackHoleRequestHandler(SocketServer.BaseRequestHandler):
@@ -105,6 +110,7 @@ class ThreadedBlackHoleServer(SocketServer.ThreadingMixIn, SocketServer.TCPServe
 
 class TestTimeout(unittest.TestCase):
     def setUp(self):
+        import random # importing here to avoid issue #2343
         self.timeout = 0.5
         self.port = random.randint(1025, 65535)
 
@@ -132,24 +138,25 @@ class TestAuthConnection(unittest.TestCase):
             raise RuntimeError("Could not set up authorization key")
 
     def tearDown(self):
-        self.servers.__exit__()
+        if self.servers is not None:
+            self.servers.__exit__()
 
     def test_connect_no_auth(self):
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, port=self.port)
 
     def test_connect_wrong_auth(self):
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, port=self.port, auth_key="")
 
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, port=self.port, auth_key="hunter3")
 
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, port=self.port, auth_key="hunter22")
 
     def test_connect_long_auth(self):
@@ -157,11 +164,11 @@ class TestAuthConnection(unittest.TestCase):
         not_long_key = str("k") * 2048
 
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: client provided an authorization key that is too long\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Client provided an authorization key that is too long.\"",
             r.connect, port=self.port, auth_key=long_key)
 
         self.assertRaisesRegexp(
-            RqlDriverError, "Server dropped connection with message: \"ERROR: incorrect authorization key\"",
+            RqlDriverError, "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"",
             r.connect, port=self.port, auth_key=not_long_key)
 
     def test_connect_correct_auth(self):
@@ -175,10 +182,12 @@ class TestWithConnection(unittest.TestCase):
         self.servers.__enter__()
         self.port = self.servers.driver_port()
         conn = r.connect(port=self.port)
-        r.db_create('test').run(conn)
+        if 'test' not in r.db_list().run(conn):
+            r.db_create('test').run(conn)
 
     def tearDown(self):
-        self.servers.__exit__(None, None, None)
+        if self.servers is not None:
+            self.servers.__exit__(None, None, None)
 
 class TestConnection(TestWithConnection):
     def test_connect_close_reconnect(self):
@@ -251,13 +260,13 @@ class TestConnection(TestWithConnection):
         c.use('db2')
         r.table('t2').run(c)
         self.assertRaisesRegexp(
-            r.RqlRuntimeError, "Table `t1` does not exist.",
+            r.RqlRuntimeError, "Table `db2.t1` does not exist.",
             r.table('t1').run, c)
 
         c.use('test')
         r.table('t1').run(c)
         self.assertRaisesRegexp(
-            r.RqlRuntimeError, "Table `t2` does not exist.",
+            r.RqlRuntimeError, "Table `test.t2` does not exist.",
             r.table('t2').run, c)
 
         c.close()
@@ -267,7 +276,7 @@ class TestConnection(TestWithConnection):
         r.table('t2').run(c)
 
         self.assertRaisesRegexp(
-            r.RqlRuntimeError, "Table `t1` does not exist.",
+            r.RqlRuntimeError, "Table `db2.t1` does not exist.",
             r.table('t1').run, c)
 
         c.close()
@@ -339,39 +348,25 @@ class TestBatching(TestWithConnection):
     def runTest(self):
         c = r.connect(port=self.port)
 
-        # Test the cursor API when there is exactly mod batch size elements in the result stream
         r.db('test').table_create('t1').run(c)
         t1 = r.table('t1')
 
-        if server_build_dir.find('debug') != -1:
-            batch_size = 5
-        else:
-            batch_size = 1000
+        batch_size = 3
+        count = 500
 
-        t1.insert([{'id':i} for i in xrange(0, batch_size)]).run(c)
-        cursor = t1.run(c)
+        ids = set(range(0, count))
 
-        # We're going to have to inspect the state of the cursor object to ensure this worked right
-        # If this test fails in the future check first if the structure of the object has changed.
-
-        # Only the first chunk (of either 1 or 2) should have loaded
-        self.assertEqual(len(cursor.responses), 1)
-
-        # Either the whole stream should have loaded in one batch or the server reserved at least
-        # one element in the stream for the second batch.
-        if cursor.end_flag:
-            self.assertEqual(len(cursor.responses[0].response), batch_size)
-        else:
-            self.assertLess(len(cursor.responses[0].response), batch_size)
+        t1.insert([{'id':i} for i in ids]).run(c)
+        cursor = t1.run(c, batch_conf={'max_els': batch_size})
 
         itr = iter(cursor)
-        for i in xrange(0, batch_size - 1):
-            itr.next()
+        for i in xrange(0, count - 1):
+            row = itr.next()
+            ids.remove(row['id'])
 
-        # In both cases now there should at least one element left in the last chunk
+        self.assertEqual(itr.next()['id'], ids.pop())
+        self.assertRaises(StopIteration, lambda: itr.next())
         self.assertTrue(cursor.end_flag)
-        self.assertGreaterEqual(len(cursor.responses), 1)
-        self.assertGreaterEqual(len(cursor.responses[0].response), 1)
 
 class TestGroupWithTimeKey(TestWithConnection):
     def runTest(self):
@@ -404,7 +399,6 @@ if __name__ == '__main__':
     loader = unittest.TestLoader()
     suite.addTest(loader.loadTestsFromTestCase(TestNoConnection))
     suite.addTest(loader.loadTestsFromTestCase(TestConnectionDefaultPort))
-    suite.addTest(loader.loadTestsFromTestCase(TestWithConnection))
     suite.addTest(loader.loadTestsFromTestCase(TestTimeout))
     suite.addTest(loader.loadTestsFromTestCase(TestAuthConnection))
     suite.addTest(loader.loadTestsFromTestCase(TestConnection))
@@ -414,6 +408,5 @@ if __name__ == '__main__':
     suite.addTest(TestGroupWithTimeKey())
 
     res = unittest.TextTestRunner(verbosity=2).run(suite)
-
     if not res.wasSuccessful():
-        exit(1)
+        sys.exit(1)

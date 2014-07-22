@@ -35,7 +35,10 @@ VANILLA_PACKAGE_NAME ?= rethinkdb
 SERVER_EXEC_NAME ?= rethinkdb
 
 # Set SYMBOLS to 1 to enable symbols, even in release mode
-SYMBOLS ?= 0
+SYMBOLS ?= 1
+
+# Put the symbols in a separate file
+SPLIT_SYMBOLS ?= 0
 
 # Add numeric indices to json objects in the json adapter
 JSON_SHORTCUTS ?= 0
@@ -71,7 +74,7 @@ STRICT_MAKE_VARIABLE_CHECK ?= 0
 COVERAGE ?= 0
 
 # Strip the executable when installing
-STRIP_ON_INSTALL ?= 1
+STRIP_ON_INSTALL ?= 0
 
 # If not empty, $(PVERSION) is used as the rethinkdb version number
 # for example, PVERSION ?= 1.3.2
@@ -113,6 +116,10 @@ PACKAGE_BUILD_NUMBER ?= 0
 # Implement coroutines on top of (POSIX) threads
 THREADED_COROUTINES ?= 0
 
+# Require MacOS package to be signed with a developer certificate
+REQUIRE_SIGNED ?= 0
+SIGNATURE_NAME ?= Developer ID Installer: Hexagram 49, Inc. (99WDWQ7WDJ)
+
 # TODO: Document these variables
 STATIC_LIBGCC ?= 0
 DISABLE_BREAKPOINTS ?= 0
@@ -129,7 +136,6 @@ KEEP_INLINE ?= 0
 OPROFILE ?= 0
 BTREE_DEBUG ?= 0
 SERIALIZER_DEBUG ?= 0
-MEMCACHED_STRICT ?= 0
 NO_EVENTFD ?= 0
 NO_EPOLL ?= 0
 LEGACY_PROC_STAT ?= 0

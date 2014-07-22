@@ -41,7 +41,7 @@ void func_t::assert_deterministic(const char *extra_msg) const {
 reql_func_t::reql_func_t(const protob_t<const Backtrace> backtrace,
                          const var_scope_t &_captured_scope,
                          std::vector<sym_t> _arg_names,
-                         counted_t<term_t> _body)
+                         counted_t<const term_t> _body)
     : func_t(backtrace), captured_scope(_captured_scope),
       arg_names(std::move(_arg_names)), body(std::move(_body)) { }
 
@@ -58,8 +58,10 @@ counted_t<val_t> reql_func_t::call(
         // way (thanks to entropy).  TODO: This is bad.
         rcheck(arg_names.size() == args.size() || arg_names.size() == 0,
                base_exc_t::GENERIC,
-               strprintf("Expected %zd argument(s) but found %zu.",
-                         arg_names.size(), args.size()));
+               strprintf("Expected %zd argument%s but found %zu.",
+                         arg_names.size(),
+                         (arg_names.size() == 1 ? "" : "s"),
+                         args.size()));
 
         var_scope_t new_scope = arg_names.size() == 0
             ? captured_scope
@@ -99,7 +101,7 @@ counted_t<val_t> js_func_t::call(
 
         try {
             result = env->get_js_runner()->call(js_source, args, config);
-        } catch (const js_worker_exc_t &e) {
+        } catch (const extproc_worker_exc_t &e) {
             rfail(base_exc_t::GENERIC,
                   "Javascript query `%s` caused a crash in a worker process.",
                   js_source.c_str());
@@ -179,7 +181,7 @@ func_term_t::func_term_t(compile_env_t *env, const protob_t<const Term> &t)
     compile_env_t body_env(std::move(varname_visibility));
 
     protob_t<const Term> body_source = t.make_child(&t->args(1));
-    counted_t<term_t> compiled_body = compile_term(&body_env, body_source);
+    counted_t<const term_t> compiled_body = compile_term(&body_env, body_source);
     r_sanity_check(compiled_body.has());
 
     var_captures_t captures;
@@ -202,11 +204,12 @@ void func_term_t::accumulate_captures(var_captures_t *captures) const {
     captures->implicit_is_captured |= external_captures.implicit_is_captured;
 }
 
-counted_t<val_t> func_term_t::term_eval(scope_env_t *env, UNUSED eval_flags_t flags) {
+counted_t<val_t> func_term_t::term_eval(scope_env_t *env,
+                                        UNUSED eval_flags_t flags) const {
     return new_val(eval_to_func(env->scope));
 }
 
-counted_t<func_t> func_term_t::eval_to_func(const var_scope_t &env_scope) {
+counted_t<func_t> func_term_t::eval_to_func(const var_scope_t &env_scope) const {
     return make_counted<reql_func_t>(get_backtrace(get_src()),
                                      env_scope.filtered_by_captures(external_captures),
                                      arg_names, body);
@@ -369,6 +372,34 @@ counted_t<func_t> new_eq_comparison_func(counted_t<const datum_t> obj,
     return func_term->eval_to_func(var_scope_t());
 }
 
+counted_t<func_t> new_page_func(counted_t<const datum_t> method,
+                                const protob_t<const Backtrace> &bt_src) {
+    if (method->get_type() != datum_t::R_NULL) {
+        std::string name = method->as_str().to_std();
+        if (name == "link-next") {
+            pb::dummy_var_t info = pb::dummy_var_t::FUNC_PAGE;
+            protob_t<Term> twrap =
+                r::fun(info,
+                       r::var(info)["header"]["link"]["rel=\"next\""]
+                           .default_(r::null()))
+                .release_counted();
+
+            propagate_backtrace(twrap.get(), bt_src.get());
+
+            compile_env_t empty_compile_env((var_visibility_t()));
+            counted_t<func_term_t> func_term =
+                make_counted<func_term_t>(&empty_compile_env, twrap);
+            return func_term->eval_to_func(var_scope_t());
+        } else {
+            std::string msg = strprintf("`page` method '%s' not recognized, "
+                                        "only 'link-next' is available.", name.c_str());
+            rcheck_src(bt_src.get(), base_exc_t::GENERIC, false, msg);
+        }
+    }
+    return counted_t<func_t>();
+}
+
+
 counted_t<val_t> js_result_visitor_t::operator()(const std::string &err_val) const {
     rfail_target(parent, base_exc_t::GENERIC, "%s", err_val.c_str());
     unreachable();
@@ -379,7 +410,9 @@ counted_t<val_t> js_result_visitor_t::operator()(
 }
 // This JS evaluation resulted in an id for a js function
 counted_t<val_t> js_result_visitor_t::operator()(UNUSED const id_t id_val) const {
-    counted_t<func_t> func = make_counted<js_func_t>(code, timeout_ms, parent->backtrace());
+    counted_t<func_t> func = make_counted<js_func_t>(code,
+                                                     timeout_ms,
+                                                     parent->backtrace());
     return make_counted<val_t>(func, parent->backtrace());
 }
 

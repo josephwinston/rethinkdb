@@ -6,6 +6,7 @@
 #include "btree/secondary_operations.hpp"
 #include "btree/slice.hpp"
 #include "concurrency/cond_var.hpp"
+#include "containers/binary_blob.hpp"
 #include "repli_timestamp.hpp"
 
 // Run backfilling at a reduced priority
@@ -13,12 +14,13 @@
 
 void btree_slice_t::init_superblock(buf_lock_t *superblock,
                                     const std::vector<char> &metainfo_key,
-                                    const std::vector<char> &metainfo_value) {
+                                    const binary_blob_t &metainfo_value) {
     buf_write_t sb_write(superblock);
-    auto sb = static_cast<btree_superblock_t *>(sb_write.get_data_write());
+    auto sb = static_cast<btree_superblock_t *>(
+            sb_write.get_data_write(BTREE_SUPERBLOCK_SIZE));
 
     // Properly zero the superblock, zeroing sb->metainfo_blob, in particular.
-    memset(sb, 0, superblock->cache()->get_block_size().value());
+    memset(sb, 0, BTREE_SUPERBLOCK_SIZE);
 
     sb->magic = btree_superblock_t::expected_magic;
     sb->root_block = NULL_BLOCK_ID;
@@ -33,8 +35,9 @@ void btree_slice_t::init_superblock(buf_lock_t *superblock,
 }
 
 btree_slice_t::btree_slice_t(cache_t *c, perfmon_collection_t *parent,
-                             const std::string &identifier)
-    : stats(parent, identifier),
+                             const std::string &identifier,
+                             index_type_t index_type)
+    : stats(parent, identifier, index_type),
       cache_(c),
       backfill_account_(cache()->create_cache_account(BACKFILL_CACHE_PRIORITY)) { }
 

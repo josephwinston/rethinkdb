@@ -1,11 +1,12 @@
 err = require('./errors')
-pb = require('./protobuf')
+
+plural = (number) -> if number == 1 then "" else "s"
 
 # Function wrapper that enforces that the function is
 # called with the correct number of arguments
 module.exports.ar = (fun) -> (args...) ->
     if args.length isnt fun.length
-        throw new err.RqlDriverError "Expected #{fun.length} argument(s) but found #{args.length}."
+        throw new err.RqlDriverError "Expected #{fun.length} argument#{plural(fun.length)} but found #{args.length}."
     fun.apply(@, args)
 
 # Like ar for variable argument functions. Takes minimum
@@ -13,10 +14,10 @@ module.exports.ar = (fun) -> (args...) ->
 module.exports.varar = (min, max, fun) -> (args...) ->
     if (min? and args.length < min) or (max? and args.length > max)
         if min? and not max?
-            throw new err.RqlDriverError "Expected #{min} or more argument(s) but found #{args.length}."
+            throw new err.RqlDriverError "Expected #{min} or more arguments but found #{args.length}."
         if max? and not min?
-            throw new err.RqlDriverError "Expected #{max} or fewer argument(s) but found #{args.length}."
-        throw new err.RqlDriverError "Expected between #{min} and #{max} argument(s) but found #{args.length}."
+            throw new err.RqlDriverError "Expected #{max} or fewer arguments but found #{args.length}."
+        throw new err.RqlDriverError "Expected between #{min} and #{max} arguments but found #{args.length}."
     fun.apply(@, args)
 
 # Like ar but for functions that take an optional options dict as the last argument
@@ -30,7 +31,10 @@ module.exports.aropt = (fun) -> (args...) ->
     numPosArgs = args.length - (if perhapsOptDict? then 1 else 0)
 
     if expectedPosArgs isnt numPosArgs
-         throw new err.RqlDriverError "Expected #{expectedPosArgs} argument(s) but found #{numPosArgs}."
+        if expectedPosArgs isnt 1
+            throw new err.RqlDriverError "Expected #{expectedPosArgs} arguments (not including options) but found #{numPosArgs}."
+        else
+            throw new err.RqlDriverError "Expected #{expectedPosArgs} argument (not including options) but found #{numPosArgs}."
     fun.apply(@, args)
 
 module.exports.toArrayBuffer = (node_buffer) ->
@@ -86,44 +90,14 @@ recursivelyConvertPseudotype = (obj, opts) ->
         obj = convertPseudotype(obj, opts)
     obj
 
-deconstructDatum = (datum, opts) ->
-    pb.DatumTypeSwitch(datum, {
-        "R_JSON": =>
-            obj = JSON.parse(datum.r_str)
-            recursivelyConvertPseudotype(obj, opts)
-       ,"R_NULL": =>
-            null
-       ,"R_BOOL": =>
-            datum.r_bool
-       ,"R_NUM": =>
-            datum.r_num
-       ,"R_STR": =>
-            datum.r_str
-       ,"R_ARRAY": =>
-            deconstructDatum(dt, opts) for dt in datum.r_array
-       ,"R_OBJECT": =>
-            obj = {}
-            for pair in datum.r_object
-                obj[pair.key] = deconstructDatum(pair.val, opts)
+mkAtom = (response, opts) -> recursivelyConvertPseudotype(response.r[0], opts)
 
-            convertPseudotype(obj, opts)
-        },
-            => throw new err.RqlDriverError "Unknown Datum type"
-        )
-
-mkAtom = (response, opts) -> deconstructDatum(response.response[0], opts)
-
-mkSeq = (response, opts) -> (deconstructDatum(res, opts) for res in response.response)
+mkSeq = (response, opts) -> recursivelyConvertPseudotype(response.r, opts)
 
 mkErr = (ErrClass, response, root) ->
-    msg = mkAtom response
+    new ErrClass(mkAtom(response), root, response.b)
 
-    bt = for frame in response.backtrace.frames
-        pb.convertFrame frame
-
-    new ErrClass msg, root, bt
-
-module.exports.deconstructDatum = deconstructDatum
+module.exports.recursivelyConvertPseudotype = recursivelyConvertPseudotype
 module.exports.mkAtom = mkAtom
 module.exports.mkSeq = mkSeq
 module.exports.mkErr = mkErr

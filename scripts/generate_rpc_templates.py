@@ -44,11 +44,12 @@ def generate_async_message_template(nargs):
         print "            %s" % csep("arg#(_arg#)")
         print "        { }"
     if nargs == 0:
-        print "        void write(write_message_t *) {"
+        print "        void write(DEBUG_VAR cluster_version_t cluster_version, write_message_t *) {"
     else:
-        print "        void write(write_message_t *msg) {"
+        print "        void write(DEBUG_VAR cluster_version_t cluster_version, write_message_t *wm) {"
+    print "            rassert(cluster_version == cluster_version_t::CLUSTER);"
     for i in xrange(nargs):
-        print "            *msg << arg%d;" % i
+        print "            serialize<cluster_version_t::CLUSTER>(wm, arg%d);" % i
     print "        }"
     print "    };"
     print
@@ -56,14 +57,15 @@ def generate_async_message_template(nargs):
     print "    public:"
     print "        explicit read_impl_t(%s *_parent) : parent(_parent) { }" % mailbox_t_str
     if nargs == 0:
-        print "        void read(UNUSED read_stream_t *stream) {"
+        print "        void read(DEBUG_VAR cluster_version_t cluster_version, UNUSED read_stream_t *stream) {"
     else:
-        print "        void read(read_stream_t *stream) {"
+        print "        void read(DEBUG_VAR cluster_version_t cluster_version, read_stream_t *stream) {"
+    print "            rassert(cluster_version == cluster_version_t::CLUSTER);"
     for i in xrange(nargs):
         print "            arg%d_t arg%d;" % (i, i)
-        print "            %sres = deserialize(stream, &arg%d);" % ("archive_result_t " if i == 0 else "", i)
+        print "            %sres = deserialize<cluster_version_t::CLUSTER>(stream, &arg%d);" % ("archive_result_t " if i == 0 else "", i)
         print "            if (bad(res)) { throw fake_archive_exc_t(); }"
-    print "            parent->fun(%s);" % csep("arg#")
+    print "            parent->fun(%s);" % csep("std::move(arg#)")
     print "        }"
     print "    private:"
     print "        %s *parent;" % mailbox_t_str
@@ -75,7 +77,7 @@ def generate_async_message_template(nargs):
     print "    typedef mailbox_addr_t< void(%s) > address_t;" % csep("arg#_t")
     print
     print "    mailbox_t(mailbox_manager_t *manager,"
-    print "              const boost::function< void(%s)> &f) :" % csep("arg#_t")
+    print "              const std::function< void(%s)> &f) :" % csep("arg#_t")
     print "        reader(this), fun(f), mailbox(manager, &reader)"
     print "        { }"
     print
@@ -93,7 +95,7 @@ def generate_async_message_template(nargs):
         print "    friend void send(mailbox_manager_t*,"
         print "                     typename mailbox_t< void(%s) >::address_t%s);" % (csep("a#_t"), cpre("const a#_t&"))
     print
-    print "    boost::function< void(%s) > fun;" % csep("arg#_t")
+    print "    std::function< void(%s) > fun;" % csep("arg#_t")
     print "    raw_mailbox_t mailbox;"
     print "};"
     print
@@ -114,7 +116,7 @@ def generate_async_message_template(nargs):
     print
 
 if __name__ == "__main__":
-    print "// Copyright 2010-2012 RethinkDB, all rights reserved."
+    print "// Copyright 2010-2014 RethinkDB, all rights reserved."
     print "#ifndef RPC_MAILBOX_TYPED_HPP_"
     print "#define RPC_MAILBOX_TYPED_HPP_"
     print
@@ -123,10 +125,9 @@ if __name__ == "__main__":
     print "Please modify '%s' instead of modifying this file.*/" % sys.argv[0]
     print
 
-    print "#include \"errors.hpp\""
-    print "#include <boost/function.hpp>"
+    print "#include <functional>"
     print
-    print "#include \"containers/archive/archive.hpp\""
+    print "#include \"containers/archive/versioned.hpp\""
     print "#include \"rpc/serialize_macros.hpp\""
     print "#include \"rpc/mailbox/mailbox.hpp\""
     print "#include \"rpc/semilattice/joins/macros.hpp\""
@@ -136,6 +137,9 @@ if __name__ == "__main__":
     print "template <class T>"
     print "class mailbox_addr_t {"
     print "public:"
+    print "    bool operator<(const mailbox_addr_t<T> &other) const {"
+    print "        return addr < other.addr;"
+    print "    }"
     print "    bool is_nil() const { return addr.is_nil(); }"
     print "    peer_id_t get_peer() const { return addr.get_peer(); }"
     print
@@ -153,6 +157,8 @@ if __name__ == "__main__":
     print
     print "    raw_mailbox_t::address_t addr;"
     print "};"
+    print
+    print "RDB_SERIALIZE_TEMPLATED_OUTSIDE(mailbox_addr_t);"
 
     for nargs in xrange(15):
         generate_async_message_template(nargs)

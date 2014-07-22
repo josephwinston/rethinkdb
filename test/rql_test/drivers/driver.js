@@ -1,4 +1,27 @@
-var r = require('../../../build/packages/js/rethinkdb');
+// -- load rethinkdb from the proper location
+rethinkdbLocation = '';
+var path = require('path');
+var fs = require('fs');
+try {
+    rethinkdbLocation = process.env.JAVASCRIPT_DRIVER_DIR;
+} catch(e) {
+    dirPath = path.resolve(__dirname)
+    while (dirPath != path.sep) {
+        if (fs.existsSync(path.resolve(dirPath, 'drivers', 'javascript'))) {
+            // TODO: try to compile the drivers
+            rethinkdbLocation = path.resolve(dirPath, 'build', 'packages', 'js');
+            break;
+        }
+        dirPath = path.dirname(targetPath)
+    }
+}
+if (fs.existsSync(path.resolve(rethinkdbLocation, 'rethinkdb.js')) == false) {
+    process.stdout.write('Could not locate the javascript drivers at the expected location: ' + rethinkdbLocation);
+    process.exit(1);
+}
+var r = require(path.resolve(rethinkdbLocation, 'rethinkdb'));
+
+// --
 
 var JSPORT = process.argv[2]
 var CPPPORT = process.argv[3]
@@ -326,20 +349,28 @@ function bag(list) {
 function err(err_name, err_msg, err_frames) {
     var err_frames = null; // TODO: test for frames
     var fun = function(other) {
-        if (!(function() {
-            if (!(other instanceof Error)) return false;
-            if (err_name && !(other.name === err_name)) return false;
+        if (!(other instanceof Error)) return false;
+        if (err_name && !(other.name === err_name)) return false;
 
-            // Strip out "offending object" from err message
-            other.msg = other.msg.replace(/:\n([\r\n]|.)*/m, ".");
-            other.msg = other.msg.replace(/\nFailed assertion([\r\n]|.)*/m, "");
+        // Strip out "offending object" from err message
+        other.msg = other.msg.replace(/:\n([\r\n]|.)*/m, ".");
+        other.msg = other.msg.replace(/\nFailed assertion([\r\n]|.)*/m, "");
 
-            if (err_msg && !(other.msg === err_msg)) return false;
-            if (err_frames && !(eq_test(other.frames, err_frames))) return false;
-            return true;
-        })()) {
-            return false;
-        }
+        if (err_msg && !(other.msg === err_msg)) return false;
+        if (err_frames && !(eq_test(other.frames, err_frames))) return false;
+        return true;
+    }
+    fun.isErr = true;
+    fun.toString = function() {
+        return err_name+"(\""+err_msg+"\")";
+    };
+    return fun;
+}
+
+function builtin_err(err_name, err_msg) {
+    var fun = function(other) {
+        if (!(other.name === err_name)) return false;
+        if (!(other.message === err_msg)) return false;
         return true;
     }
     fun.isErr = true;

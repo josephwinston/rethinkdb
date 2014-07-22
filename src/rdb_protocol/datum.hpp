@@ -2,6 +2,8 @@
 #ifndef RDB_PROTOCOL_DATUM_HPP_
 #define RDB_PROTOCOL_DATUM_HPP_
 
+#include <float.h>
+
 #include <map>
 #include <memory>
 #include <set>
@@ -19,12 +21,19 @@
 #include "containers/wire_string.hpp"
 #include "http/json.hpp"
 #include "rdb_protocol/error.hpp"
+#include "rdb_protocol/serialize_datum.hpp"
+#include "version.hpp"
+
+// Enough precision to reconstruct doubles from their decimal representations.
+// Unlike the late DBLPRI, this lacks a percent sign.
+#define PR_RECONSTRUCTABLE_DOUBLE ".20g"
 
 class Datum;
 
 RDB_DECLARE_SERIALIZABLE(Datum);
 
 namespace ql {
+
 class datum_stream_t;
 class env_t;
 class val_t;
@@ -34,6 +43,9 @@ class datum_cmp_t;
 void time_to_str_key(const datum_t &d, std::string *str_out);
 void sanitize_time(datum_t *time);
 } // namespace pseudo
+
+static const double max_dbl_int = 0x1LL << DBL_MANT_DIG;
+static const double min_dbl_int = max_dbl_int * -1;
 
 // These let us write e.g. `foo(NOTHROW) instead of `foo(false/*nothrow*/)`.
 // They should be passed to functions that have multiple behaviors (like `get` or
@@ -70,9 +82,9 @@ public:
     datum_t(type_t _type, bool _bool);
     explicit datum_t(double _num);
     // TODO: Eventually get rid of the std::string constructor (in favor of
-    //   wire_string_t *)
+    //   scoped_ptr_t<wire_string_t>)
     explicit datum_t(std::string &&str);
-    explicit datum_t(wire_string_t *str);
+    explicit datum_t(scoped_ptr_t<wire_string_t> str);
     explicit datum_t(const char *cstr);
     explicit datum_t(std::vector<counted_t<const datum_t> > &&_array);
     explicit datum_t(std::map<std::string, counted_t<const datum_t> > &&object);
@@ -210,6 +222,11 @@ private:
     static const std::set<std::string> _allowed_pts;
     void maybe_sanitize_ptype(const std::set<std::string> &allowed_pts = _allowed_pts);
 
+    // Helper function for `merge()`:
+    // Returns a version of this where all `literal` pseudotypes have been omitted.
+    // Might return null, if this is a literal without a value.
+    counted_t<const datum_t> drop_literals(bool *encountered_literal_out) const;
+
     type_t type;
     union {
         bool r_bool;
@@ -220,19 +237,11 @@ private:
     };
 
 public:
-    static const char* const reql_type_string;
+    static const char *const reql_type_string;
 
 private:
     DISABLE_COPYING(datum_t);
 };
-
-size_t serialized_size(const counted_t<const datum_t> &datum);
-
-write_message_t &operator<<(write_message_t &wm, const counted_t<const datum_t> &datum);
-archive_result_t deserialize(read_stream_t *s, counted_t<const datum_t> *datum);
-
-write_message_t &operator<<(write_message_t &wm, const empty_ok_t<const counted_t<const datum_t> > &datum);
-archive_result_t deserialize(read_stream_t *s, empty_ok_ref_t<counted_t<const datum_t> > datum);
 
 // Converts a double to int, but returns false if it's not an integer or out of range.
 bool number_as_integer(double d, int64_t *i_out);
@@ -292,43 +301,6 @@ private:
     scoped_ptr_t<datum_t> ptr_;
     DISABLE_COPYING(datum_ptr_t);
 };
-
-// This is like a `wire_datum_t` but for gmr.  We need it because gmr allows
-// non-strings as keys, while the data model we pinched from JSON doesn't.  See
-// README.md for more info.
-class wire_datum_map_t {
-public:
-    wire_datum_map_t() : state(COMPILED) { }
-    bool has(counted_t<const datum_t> key);
-    counted_t<const datum_t> get(counted_t<const datum_t> key);
-    void set(counted_t<const datum_t> key, counted_t<const datum_t> val);
-
-    void compile();
-    void finalize();
-
-    counted_t<const datum_t> to_arr() const;
-private:
-    struct datum_value_compare_t {
-        bool operator()(counted_t<const datum_t> a, counted_t<const datum_t> b) const {
-            return *a < *b;
-        }
-    };
-
-    std::map<counted_t<const datum_t>,
-             counted_t<const datum_t>,
-             datum_value_compare_t> map;
-    std::vector<std::pair<Datum, Datum> > map_pb;
-
-public:
-    friend class write_message_t;
-    void rdb_serialize(write_message_t &msg /* NOLINT */) const;
-    friend class archive_deserializer_t;
-    archive_result_t rdb_deserialize(read_stream_t *s);
-
-private:
-    enum { SERIALIZABLE, COMPILED } state;
-};
-
 
 // This function is used by e.g. foreach to merge statistics from multiple write
 // operations.

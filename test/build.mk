@@ -1,4 +1,6 @@
 
+include $(TOP)/test/protobuf_test/build.mk
+
 $/bench/stress-client/stress:
 	$P MAKE -C $/bench/stress-client
 	$(EXTERN_MAKE) -C $/bench/stress-client
@@ -13,7 +15,7 @@ test-deps: $(BUILD_DIR)/rethinkdb $(BUILD_DIR)/rethinkdb-unittest $/bench/stress
 .PHONY: test
 test: test-deps
 	$P RUN-TESTS $(TEST)
-	MAKEFLAGS= $/scripts/run-tests.sh $(RUN_TEST_ARGS) -b $(BUILD_DIR) $(TEST)
+	MAKEFLAGS= $/test/run $(RUN_TEST_ARGS) -b $(BUILD_DIR) $(TEST)
 
 .PHONY: full-test
 full-test: TEST = all

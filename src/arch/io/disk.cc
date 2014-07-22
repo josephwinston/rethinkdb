@@ -8,22 +8,24 @@
 #include <sys/file.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <limits.h>
 
 #include <algorithm>
 #include <functional>
 
 #include "arch/types.hpp"
 #include "arch/runtime/thread_pool.hpp"
-#include "config/args.hpp"
-#include "backtrace.hpp"
 #include "arch/runtime/runtime.hpp"
 #include "arch/io/disk/filestat.hpp"
 #include "arch/io/disk/pool.hpp"
 #include "arch/io/disk/conflict_resolving.hpp"
 #include "arch/io/disk/stats.hpp"
 #include "arch/io/disk/accounting.hpp"
+#include "backtrace.hpp"
+#include "config/args.hpp"
 #include "do_on_thread.hpp"
 #include "logger.hpp"
+#include "utils.hpp"
 
 void verify_aligned_file_access(DEBUG_VAR int64_t file_size, DEBUG_VAR int64_t offset,
                                 DEBUG_VAR size_t length,
@@ -70,7 +72,9 @@ public:
     }
 
     ~linux_disk_manager_t() {
-        rassert(outstanding_txn == 0, "Closing a file with outstanding txns\n");
+        rassert(outstanding_txn == 0,
+                "Closing a file with outstanding txns (%" PRIiPTR " of them)\n",
+                outstanding_txn);
     }
 
     void *create_account(int pri, int outstanding_requests_limit) {
@@ -79,6 +83,8 @@ public:
 
     void delayed_destroy(void *_account) {
         on_thread_t t(home_thread());
+
+        // The account destructor can block if there are outstanding requests.
         delete static_cast<accounting_diskmgr_t::account_t *>(_account);
     }
 
@@ -100,6 +106,20 @@ public:
 
         action_t *a = new action_t(calling_thread, cb);
         a->make_write(fd, buf, count, offset, wrap_in_datasyncs);
+        a->account = static_cast<accounting_diskmgr_t::account_t *>(account);
+
+        do_on_thread(home_thread(),
+                     std::bind(&linux_disk_manager_t::submit_action_to_stack_stats, this,
+                               a));
+    }
+
+    void submit_resize(fd_t fd, int64_t new_size,
+                      void *account, linux_iocallback_t *cb,
+                      bool wrap_in_datasyncs) {
+        threadnum_t calling_thread = get_thread_id();
+
+        action_t *a = new action_t(calling_thread, cb);
+        a->make_resize(fd, new_size, wrap_in_datasyncs);
         a->account = static_cast<accounting_diskmgr_t::account_t *>(account);
 
         do_on_thread(home_thread(),
@@ -147,7 +167,7 @@ public:
         } else {
             do_on_thread(a2->cb_thread,
                          std::bind(&linux_iocallback_t::on_io_failure,
-                                   a2->cb, a2->get_errno(),
+                                   a2->cb, a2->get_io_errno(),
                                    static_cast<int64_t>(a2->get_offset()),
                                    static_cast<int64_t>(a2->get_count())));
         }
@@ -177,7 +197,7 @@ private:
     pool_diskmgr_t backend;
 
 
-    int outstanding_txn;
+    intptr_t outstanding_txn;
 
     DISABLE_COPYING(linux_disk_manager_t);
 };
@@ -207,28 +227,48 @@ linux_file_t::linux_file_t(scoped_fd_t &&_fd, int64_t _file_size, linux_disk_man
     }
 }
 
-int64_t linux_file_t::get_size() {
+int64_t linux_file_t::get_file_size() {
     return file_size;
 }
 
-void linux_file_t::set_size(int64_t size) {
-    CT_ASSERT(sizeof(off_t) == sizeof(int64_t));
-    int res;
-    do {
-        res = ftruncate(fd.get(), size);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res == 0, "Could not ftruncate()");
+/* If you want to use this for downsizing a file, please check the WARNING about
+`set_file_size()` in disk.hpp. */
+void linux_file_t::set_file_size(int64_t size) {
+    assert_thread();
+    rassert(diskmgr, "No diskmgr has been constructed (are we running without an event queue?)");
 
-    int errcode = perform_datasync(fd.get());
-    guarantee_xerr(errcode == 0, errcode, "Could not sync after ftruncate");
+    struct rs_callback_t : public linux_iocallback_t, cond_t {
+        void on_io_complete() {
+            delete this;
+        }
+
+        void on_io_failure(int errsv, int64_t offset, int64_t) {
+            crash("ftruncate failed.  (%s) (target size = %" PRIi64 ")",
+                  errno_string(errsv).c_str(), offset);
+        }
+
+        auto_drainer_t::lock_t lock;
+    };
+    rs_callback_t *rs_callback = new rs_callback_t();
+    rs_callback->lock = file_size_ops_drainer.lock();
+    diskmgr->submit_resize(fd.get(), size, default_account->get_account(),
+                           rs_callback, true);
 
     file_size = size;
 }
 
-void linux_file_t::set_size_at_least(int64_t size) {
-    /* Grow in large chunks at a time */
+// For growing in large chunks at a time.
+int64_t chunk_factor(int64_t size) {
+    // x is at most 6.25% of size.
+    int64_t x = (size / (DEFAULT_EXTENT_SIZE * 16)) * DEFAULT_EXTENT_SIZE;
+    return clamp<int64_t>(x, DEVICE_BLOCK_SIZE * 128, DEFAULT_EXTENT_SIZE * 64);
+}
+
+void linux_file_t::set_file_size_at_least(int64_t size) {
+    assert_thread();
     if (file_size < size) {
-        set_size(ceil_aligned(size, DEVICE_BLOCK_SIZE * 128));
+        /* Grow in large chunks at a time */
+        set_file_size(ceil_aligned(size, chunk_factor(size)));
     }
 }
 
@@ -319,10 +359,12 @@ bool linux_file_t::coop_lock_and_check() {
 }
 
 void *linux_file_t::create_account(int priority, int outstanding_requests_limit) {
+    assert_thread();
     return diskmgr->create_account(priority, outstanding_requests_limit);
 }
 
 void linux_file_t::destroy_account(void *account) {
+    assert_thread();
     diskmgr->destroy_account(account);
 }
 
@@ -453,7 +495,7 @@ file_open_result_t open_file(const char *path, const int mode, io_backender_t *b
 
     // Call fsync() on the parent directory to guarantee that the newly
     // created file's directory entry is persisted to disk.
-    guarantee_fsync_parent_directory(path);
+    warn_fsync_parent_directory(path);
 
     out->init(new linux_file_t(std::move(fd), file_size, backender->get_diskmgr_ptr()));
 
@@ -544,7 +586,13 @@ MUST_USE int fsync_parent_directory(const char *path) {
     return 0;
 }
 
-void guarantee_fsync_parent_directory(const char *path) {
+void warn_fsync_parent_directory(const char *path) {
     int sync_res = fsync_parent_directory(path);
-    guarantee_xerr(sync_res == 0, sync_res, "Failed to fsync() parent directory of '%s'.", path);
+    if (sync_res != 0) {
+        logWRN("Failed to sync parent directory of \"%s\" (errno: %d - %s). "
+               "You may encounter data loss in case of a system failure. "
+               "(Is the file located on a filesystem that doesn't support directory sync? "
+               "e.g. VirtualBox shared folders)",
+               path, sync_res, errno_string(sync_res).c_str());
+    }
 }

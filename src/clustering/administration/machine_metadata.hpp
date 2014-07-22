@@ -18,13 +18,11 @@ class machine_semilattice_metadata_t {
 public:
     vclock_t<datacenter_id_t> datacenter;
     vclock_t<name_string_t> name;
-
-
-    RDB_MAKE_ME_SERIALIZABLE_2(datacenter, name);
 };
 
-RDB_MAKE_SEMILATTICE_JOINABLE_2(machine_semilattice_metadata_t, datacenter, name);
-RDB_MAKE_EQUALITY_COMPARABLE_2(machine_semilattice_metadata_t, datacenter, name);
+RDB_DECLARE_SERIALIZABLE(machine_semilattice_metadata_t);
+RDB_DECLARE_SEMILATTICE_JOINABLE(machine_semilattice_metadata_t);
+RDB_DECLARE_EQUALITY_COMPARABLE(machine_semilattice_metadata_t);
 
 //json adapter concept for machine_semilattice_metadata_t
 json_adapter_if_t::json_adapter_map_t with_ctx_get_json_subfields(machine_semilattice_metadata_t *target, const vclock_ctx_t &ctx);
@@ -36,12 +34,11 @@ class machines_semilattice_metadata_t {
 public:
     typedef std::map<machine_id_t, deletable_t<machine_semilattice_metadata_t> > machine_map_t;
     machine_map_t machines;
-
-    RDB_MAKE_ME_SERIALIZABLE_1(machines);
 };
 
-RDB_MAKE_SEMILATTICE_JOINABLE_1(machines_semilattice_metadata_t, machines);
-RDB_MAKE_EQUALITY_COMPARABLE_1(machines_semilattice_metadata_t, machines);
+RDB_DECLARE_SERIALIZABLE(machines_semilattice_metadata_t);
+RDB_DECLARE_SEMILATTICE_JOINABLE(machines_semilattice_metadata_t);
+RDB_DECLARE_EQUALITY_COMPARABLE(machines_semilattice_metadata_t);
 
 //json adapter concept for machines_semilattice_metadata_t
 json_adapter_if_t::json_adapter_map_t with_ctx_get_json_subfields(machines_semilattice_metadata_t *target, const vclock_ctx_t &ctx);

@@ -4,14 +4,16 @@
 #include "arch/io/disk.hpp"
 #include "arch/runtime/coroutines.hpp"
 #include "arch/timing.hpp"
-#include "btree/btree_store.hpp"
 #include "btree/operations.hpp"
+#include "buffer_cache/alt/cache_balancer.hpp"
 #include "containers/archive/boost_types.hpp"
 #include "containers/archive/vector_stream.hpp"
+#include "containers/uuid.hpp"
 #include "rdb_protocol/btree.hpp"
 #include "rdb_protocol/minidriver.hpp"
 #include "rdb_protocol/pb_utils.hpp"
 #include "rdb_protocol/protocol.hpp"
+#include "rdb_protocol/store.hpp"
 #include "rdb_protocol/sym.hpp"
 #include "stl_utils.hpp"
 #include "serializer/config.hpp"
@@ -23,7 +25,7 @@
 
 namespace unittest {
 
-void insert_rows(int start, int finish, btree_store_t<rdb_protocol_t> *store) {
+void insert_rows(int start, int finish, store_t *store) {
     guarantee(start <= finish);
     for (int i = start; i < finish; ++i) {
         cond_t dummy_interruptor;
@@ -53,32 +55,29 @@ void insert_rows(int start, int finish, btree_store_t<rdb_protocol_t> *store) {
             buf_lock_t sindex_block
                 = store->acquire_sindex_block_for_write(superblock->expose_buf(),
                                                         sindex_block_id);
-            btree_store_t<rdb_protocol_t>::sindex_access_vector_t sindexes;
+            store_t::sindex_access_vector_t sindexes;
             store->acquire_post_constructed_sindex_superblocks_for_write(
                      &sindex_block,
                      &sindexes);
             rdb_update_sindexes(sindexes, &mod_report, txn.get(), &deletion_context);
 
-            mutex_t::acq_t acq;
-            store->lock_sindex_queue(&sindex_block, &acq);
+            scoped_ptr_t<new_mutex_in_line_t> acq =
+                store->get_in_line_for_sindex_queue(&sindex_block);
 
-            write_message_t wm;
-            wm << rdb_sindex_change_t(mod_report);
-
-            store->sindex_queue_push(wm, &acq);
+            store->sindex_queue_push(mod_report, acq.get());
         }
     }
 }
 
 void insert_rows_and_pulse_when_done(int start, int finish,
-        btree_store_t<rdb_protocol_t> *store, cond_t *pulse_when_done) {
+        store_t *store, cond_t *pulse_when_done) {
     insert_rows(start, finish, store);
     pulse_when_done->pulse();
 }
 
-std::string create_sindex(btree_store_t<rdb_protocol_t> *store) {
+sindex_name_t create_sindex(store_t *store) {
     cond_t dummy_interruptor;
-    std::string sindex_id = uuid_to_str(generate_uuid());
+    sindex_name_t sindex_name(uuid_to_str(generate_uuid()));
     write_token_pair_t token_pair;
     store->new_write_token_pair(&token_pair);
 
@@ -97,8 +96,7 @@ std::string create_sindex(btree_store_t<rdb_protocol_t> *store) {
     sindex_multi_bool_t multi_bool = sindex_multi_bool_t::SINGLE;
 
     write_message_t wm;
-    wm << m;
-    wm << multi_bool;
+    serialize_sindex_info(&wm, m, multi_bool);
 
     vector_stream_t stream;
     stream.reserve(wm.size());
@@ -109,14 +107,14 @@ std::string create_sindex(btree_store_t<rdb_protocol_t> *store) {
         = store->acquire_sindex_block_for_write(super_block->expose_buf(),
                                                 super_block->get_sindex_block_id());
     UNUSED bool b = store->add_sindex(
-            sindex_id,
+            sindex_name,
             stream.vector(),
             &sindex_block);
-    return sindex_id;
+    return sindex_name;
 }
 
-void drop_sindex(btree_store_t<rdb_protocol_t> *store,
-                 const std::string &sindex_id) {
+void drop_sindex(store_t *store,
+                 const sindex_name_t &sindex_name) {
     cond_t dummy_interruptor;
     write_token_pair_t token_pair;
     store->new_write_token_pair(&token_pair);
@@ -128,24 +126,17 @@ void drop_sindex(btree_store_t<rdb_protocol_t> *store,
                                         1, write_durability_t::SOFT, &token_pair,
                                         &txn, &super_block, &dummy_interruptor);
 
-    value_sizer_t<rdb_value_t> sizer(store->cache->get_block_size());
-
     buf_lock_t sindex_block
         = store->acquire_sindex_block_for_write(super_block->expose_buf(),
                                                 super_block->get_sindex_block_id());
-    rdb_live_deletion_context_t live_deletion_context;
-        rdb_post_construction_deletion_context_t post_construction_deletion_context;
+    std::set<std::string> created_sindexes;
     store->drop_sindex(
-            sindex_id,
-            &sindex_block,
-            &sizer,
-            &live_deletion_context,
-            &post_construction_deletion_context,
-            &dummy_interruptor);
+            sindex_name,
+            std::move(sindex_block));
 }
 
 void bring_sindexes_up_to_date(
-        btree_store_t<rdb_protocol_t> *store, std::string sindex_id) {
+        store_t *store, sindex_name_t sindex_name) {
     cond_t dummy_interruptor;
     write_token_pair_t token_pair;
     store->new_write_token_pair(&token_pair);
@@ -160,16 +151,16 @@ void bring_sindexes_up_to_date(
         = store->acquire_sindex_block_for_write(super_block->expose_buf(),
                                                 super_block->get_sindex_block_id());
 
-    std::set<std::string> created_sindexes;
-    created_sindexes.insert(sindex_id);
+    std::set<sindex_name_t> created_sindexes;
+    created_sindexes.insert(sindex_name);
 
-    rdb_protocol_details::bring_sindexes_up_to_date(created_sindexes, store,
+    rdb_protocol::bring_sindexes_up_to_date(created_sindexes, store,
                                                     &sindex_block);
     nap(1000);
 }
 
-void spawn_writes_and_bring_sindexes_up_to_date(btree_store_t<rdb_protocol_t> *store,
-        std::string sindex_id, cond_t *background_inserts_done) {
+void spawn_writes_and_bring_sindexes_up_to_date(store_t *store,
+        sindex_name_t sindex_name, cond_t *background_inserts_done) {
     cond_t dummy_interruptor;
     write_token_pair_t token_pair;
     store->new_write_token_pair(&token_pair);
@@ -189,15 +180,15 @@ void spawn_writes_and_bring_sindexes_up_to_date(btree_store_t<rdb_protocol_t> *s
                 (TOTAL_KEYS_TO_INSERT * 9) / 10, TOTAL_KEYS_TO_INSERT,
                 store, background_inserts_done));
 
-    std::set<std::string> created_sindexes;
-    created_sindexes.insert(sindex_id);
+    std::set<sindex_name_t> created_sindexes;
+    created_sindexes.insert(sindex_name);
 
-    rdb_protocol_details::bring_sindexes_up_to_date(created_sindexes, store,
+    rdb_protocol::bring_sindexes_up_to_date(created_sindexes, store,
                                                     &sindex_block);
 }
 
-void _check_keys_are_present(btree_store_t<rdb_protocol_t> *store,
-        std::string sindex_id) {
+void _check_keys_are_present(store_t *store,
+        sindex_name_t sindex_name) {
     cond_t dummy_interruptor;
     for (int i = 0; i < TOTAL_KEYS_TO_INSERT; ++i) {
         read_token_pair_t token_pair;
@@ -211,30 +202,33 @@ void _check_keys_are_present(btree_store_t<rdb_protocol_t> *store,
                 &dummy_interruptor, true);
 
         scoped_ptr_t<real_superblock_t> sindex_sb;
+        uuid_u sindex_uuid;
 
         bool sindex_exists = store->acquire_sindex_superblock_for_read(
-                sindex_id,
+                sindex_name,
+                "",
                 super_block.get(),
                 &sindex_sb,
-                static_cast<std::vector<char>*>(NULL));
+                static_cast<std::vector<char>*>(NULL),
+                &sindex_uuid);
         ASSERT_TRUE(sindex_exists);
 
-        rdb_protocol_t::rget_read_response_t res;
+        rget_read_response_t res;
         double ii = i * i;
         /* The only thing this does is have a NULL scoped_ptr_t<trace_t> in it
          * which prevents to profiling code from crashing. */
-        ql::env_t dummy_env(NULL, NULL);
+        ql::env_t dummy_env(&dummy_interruptor);
         rdb_rget_slice(
-            store->get_sindex_slice(sindex_id),
-            rdb_protocol_t::sindex_key_range(
+            store->get_sindex_slice(sindex_uuid),
+            rdb_protocol::sindex_key_range(
                 store_key_t(make_counted<const ql::datum_t>(ii)->print_primary()),
                 store_key_t(make_counted<const ql::datum_t>(ii)->print_primary())),
             sindex_sb.get(),
             &dummy_env, // env_t
             ql::batchspec_t::user(ql::batch_type_t::NORMAL,
                                   counted_t<const ql::datum_t>()),
-            std::vector<rdb_protocol_details::transform_variant_t>(),
-            boost::optional<rdb_protocol_details::terminal_variant_t>(),
+            std::vector<ql::transform_variant_t>(),
+            boost::optional<ql::terminal_variant_t>(),
             sorting_t::ASCENDING,
             &res);
 
@@ -251,12 +245,12 @@ void _check_keys_are_present(btree_store_t<rdb_protocol_t> *store,
     }
 }
 
-void check_keys_are_present(btree_store_t<rdb_protocol_t> *store,
-        std::string sindex_id) {
+void check_keys_are_present(store_t *store,
+        sindex_name_t sindex_name) {
     for (int i = 0; i < MAX_RETRIES_FOR_SINDEX_POSTCONSTRUCT; ++i) {
         try {
-            _check_keys_are_present(store, sindex_id);
-        } catch (const sindex_not_post_constructed_exc_t&) { }
+            _check_keys_are_present(store, sindex_name);
+        } catch (const sindex_not_ready_exc_t&) { }
         /* Unfortunately we don't have an easy way right now to tell if the
          * sindex has actually been postconstructed so we just need to
          * check by polling. */
@@ -264,8 +258,8 @@ void check_keys_are_present(btree_store_t<rdb_protocol_t> *store,
     }
 }
 
-void _check_keys_are_NOT_present(btree_store_t<rdb_protocol_t> *store,
-        std::string sindex_id) {
+void _check_keys_are_NOT_present(store_t *store,
+        sindex_name_t sindex_name) {
     /* Check that we don't have any of the keys (we just deleted them all) */
     cond_t dummy_interruptor;
     for (int i = 0; i < TOTAL_KEYS_TO_INSERT; ++i) {
@@ -280,30 +274,33 @@ void _check_keys_are_NOT_present(btree_store_t<rdb_protocol_t> *store,
                 &dummy_interruptor, true);
 
         scoped_ptr_t<real_superblock_t> sindex_sb;
+        uuid_u sindex_uuid;
 
         bool sindex_exists = store->acquire_sindex_superblock_for_read(
-                sindex_id,
+                sindex_name,
+                "",
                 super_block.get(),
                 &sindex_sb,
-                static_cast<std::vector<char>*>(NULL));
+                static_cast<std::vector<char>*>(NULL),
+                &sindex_uuid);
         ASSERT_TRUE(sindex_exists);
 
-        rdb_protocol_t::rget_read_response_t res;
+        rget_read_response_t res;
         double ii = i * i;
         /* The only thing this does is have a NULL scoped_ptr_t<trace_t> in it
-         * which prevents the profiling code from crashing. */
-        ql::env_t dummy_env(NULL, NULL);
+           which prevents the profiling code from crashing. */
+        ql::env_t dummy_env(&dummy_interruptor);
         rdb_rget_slice(
-            store->get_sindex_slice(sindex_id),
-            rdb_protocol_t::sindex_key_range(
+            store->get_sindex_slice(sindex_uuid),
+            rdb_protocol::sindex_key_range(
                 store_key_t(make_counted<const ql::datum_t>(ii)->print_primary()),
                 store_key_t(make_counted<const ql::datum_t>(ii)->print_primary())),
             sindex_sb.get(),
             &dummy_env, // env_t
             ql::batchspec_t::user(ql::batch_type_t::NORMAL,
                                   counted_t<const ql::datum_t>()),
-            std::vector<rdb_protocol_details::transform_variant_t>(),
-            boost::optional<rdb_protocol_details::terminal_variant_t>(),
+            std::vector<ql::transform_variant_t>(),
+            boost::optional<ql::terminal_variant_t>(),
             sorting_t::ASCENDING,
             &res);
 
@@ -313,12 +310,12 @@ void _check_keys_are_NOT_present(btree_store_t<rdb_protocol_t> *store,
     }
 }
 
-void check_keys_are_NOT_present(btree_store_t<rdb_protocol_t> *store,
-        std::string sindex_id) {
+void check_keys_are_NOT_present(store_t *store,
+        sindex_name_t sindex_name) {
     for (int i = 0; i < MAX_RETRIES_FOR_SINDEX_POSTCONSTRUCT; ++i) {
         try {
-            _check_keys_are_NOT_present(store, sindex_id);
-        } catch (const sindex_not_post_constructed_exc_t&) { }
+            _check_keys_are_NOT_present(store, sindex_name);
+        } catch (const sindex_not_ready_exc_t&) { }
         /* Unfortunately we don't have an easy way right now to tell if the
          * sindex has actually been postconstructed so we just need to
          * check by polling. */
@@ -331,6 +328,7 @@ TPTEST(RDBBtree, SindexPostConstruct) {
     temp_file_t temp_file;
 
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
+    dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
     standard_serializer_t::create(
@@ -342,10 +340,10 @@ TPTEST(RDBBtree, SindexPostConstruct) {
         &file_opener,
         &get_global_perfmon_collection());
 
-    rdb_protocol_t::store_t store(
+    store_t store(
             &serializer,
+            &balancer,
             "unit_test_store",
-            GIGABYTE,
             true,
             &get_global_perfmon_collection(),
             NULL,
@@ -356,14 +354,14 @@ TPTEST(RDBBtree, SindexPostConstruct) {
 
     insert_rows(0, (TOTAL_KEYS_TO_INSERT * 9) / 10, &store);
 
-    std::string sindex_id = create_sindex(&store);
+    sindex_name_t sindex_name = create_sindex(&store);
 
     cond_t background_inserts_done;
-    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_id,
+    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_name,
             &background_inserts_done);
     background_inserts_done.wait();
 
-    check_keys_are_present(&store, sindex_id);
+    check_keys_are_present(&store, sindex_name);
 }
 
 TPTEST(RDBBtree, SindexEraseRange) {
@@ -371,6 +369,7 @@ TPTEST(RDBBtree, SindexEraseRange) {
     temp_file_t temp_file;
 
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
+    dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
     standard_serializer_t::create(
@@ -382,10 +381,10 @@ TPTEST(RDBBtree, SindexEraseRange) {
         &file_opener,
         &get_global_perfmon_collection());
 
-    rdb_protocol_t::store_t store(
+    store_t store(
             &serializer,
+            &balancer,
             "unit_test_store",
-            GIGABYTE,
             true,
             &get_global_perfmon_collection(),
             NULL,
@@ -396,14 +395,14 @@ TPTEST(RDBBtree, SindexEraseRange) {
 
     insert_rows(0, (TOTAL_KEYS_TO_INSERT * 9) / 10, &store);
 
-    std::string sindex_id = create_sindex(&store);
+    sindex_name_t sindex_name = create_sindex(&store);
 
     cond_t background_inserts_done;
-    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_id,
+    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_name,
             &background_inserts_done);
     background_inserts_done.wait();
 
-    check_keys_are_present(&store, sindex_id);
+    check_keys_are_present(&store, sindex_name);
 
     {
         /* Now we erase all of the keys we just inserted. */
@@ -421,18 +420,22 @@ TPTEST(RDBBtree, SindexEraseRange) {
                                            &dummy_interruptor);
 
         const hash_region_t<key_range_t> test_range = hash_region_t<key_range_t>::universe();
-        rdb_protocol_details::range_key_tester_t tester(&test_range);
+        rdb_protocol::range_key_tester_t tester(&test_range);
         buf_lock_t sindex_block
             = store.acquire_sindex_block_for_write(super_block->expose_buf(),
                                                    super_block->get_sindex_block_id());
-        rdb_erase_major_range(&tester,
+
+        rdb_live_deletion_context_t deletion_context;
+        std::vector<rdb_modification_report_t> mod_reports_out;
+        rdb_erase_small_range(&tester,
                               key_range_t::universe(),
-                              &sindex_block,
-                              super_block.get(), &store,
-                              &dummy_interruptor);
+                              super_block.get(),
+                              &deletion_context,
+                              &dummy_interruptor,
+                              &mod_reports_out);
     }
 
-    check_keys_are_NOT_present(&store, sindex_id);
+    check_keys_are_NOT_present(&store, sindex_name);
 }
 
 TPTEST(RDBBtree, SindexInterruptionViaDrop) {
@@ -440,6 +443,7 @@ TPTEST(RDBBtree, SindexInterruptionViaDrop) {
     temp_file_t temp_file;
 
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
+    dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
     standard_serializer_t::create(
@@ -451,10 +455,10 @@ TPTEST(RDBBtree, SindexInterruptionViaDrop) {
         &file_opener,
         &get_global_perfmon_collection());
 
-    rdb_protocol_t::store_t store(
+    store_t store(
             &serializer,
+            &balancer,
             "unit_test_store",
-            GIGABYTE,
             true,
             &get_global_perfmon_collection(),
             NULL,
@@ -465,13 +469,13 @@ TPTEST(RDBBtree, SindexInterruptionViaDrop) {
 
     insert_rows(0, (TOTAL_KEYS_TO_INSERT * 9) / 10, &store);
 
-    std::string sindex_id = create_sindex(&store);
+    sindex_name_t sindex_name = create_sindex(&store);
 
     cond_t background_inserts_done;
-    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_id,
+    spawn_writes_and_bring_sindexes_up_to_date(&store, sindex_name,
             &background_inserts_done);
 
-    drop_sindex(&store, sindex_id);
+    drop_sindex(&store, sindex_name);
     background_inserts_done.wait();
 }
 
@@ -480,6 +484,7 @@ TPTEST(RDBBtree, SindexInterruptionViaStoreDelete) {
     temp_file_t temp_file;
 
     io_backender_t io_backender(file_direct_io_mode_t::buffered_desired);
+    dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
     standard_serializer_t::create(
@@ -491,24 +496,22 @@ TPTEST(RDBBtree, SindexInterruptionViaStoreDelete) {
         &file_opener,
         &get_global_perfmon_collection());
 
-    scoped_ptr_t<rdb_protocol_t::store_t> store(
-            new rdb_protocol_t::store_t(
+    scoped_ptr_t<store_t> store(
+            new store_t(
             &serializer,
+            &balancer,
             "unit_test_store",
-            GIGABYTE,
             true,
             &get_global_perfmon_collection(),
             NULL,
             &io_backender,
             base_path_t(".")));
 
-    cond_t dummy_interruptor;
-
     insert_rows(0, (TOTAL_KEYS_TO_INSERT * 9) / 10, store.get());
 
-    std::string sindex_id = create_sindex(store.get());
+    sindex_name_t sindex_name = create_sindex(store.get());
 
-    bring_sindexes_up_to_date(store.get(), sindex_id);
+    bring_sindexes_up_to_date(store.get(), sindex_name);
 
     store.reset();
 }

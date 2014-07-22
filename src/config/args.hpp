@@ -16,7 +16,13 @@
  */
 
 #define SOFTWARE_NAME_STRING "RethinkDB"
-#define SERIALIZER_VERSION_STRING "1.12"
+
+// The SERIALIZER_VERSION_STRING might remain unchanged for a while -- individual
+// metablocks now have a disk_format_version field that can be incremented for
+// on-the-fly version updating.
+#define SERIALIZER_VERSION_STRING "1.13"
+
+// See also CLUSTER_VERSION_STRING and cluster_version_t.
 
 /**
  * Basic configuration parameters.
@@ -57,19 +63,6 @@
 // 0 = minimal priority
 #define SINDEX_POST_CONSTRUCTION_CACHE_PRIORITY   5
 
-// Garbage Collection uses its own two IO accounts.
-// There is one low-priority account that is meant to guarantee
-// (performance-wise) unintrusive garbage collection.
-// If the garbage ratio keeps growing,
-// GC starts using the high priority account instead, which
-// might have a negative influence on database performance
-// under i/o heavy workloads but guarantees that the database
-// doesn't grow indefinitely.
-//
-// This is a one-per-serializer/file priority.
-#define GC_IO_PRIORITY_NICE                       8
-#define GC_IO_PRIORITY_HIGH                       (4 * CACHE_WRITES_IO_PRIORITY * CPU_SHARDING_FACTOR)
-
 // Size of the buffer used to perform IO operations (in bytes).
 #define IO_BUFFER_SIZE                            (4 * KILOBYTE)
 
@@ -83,11 +76,12 @@
 #define DEFAULT_BTREE_BLOCK_SIZE                  (4 * KILOBYTE)
 
 // Size of each extent (in bytes)
-#define DEFAULT_EXTENT_SIZE                       (512 * KILOBYTE)
+// This should not be too small, or garbage collection will become
+// inefficient (especially on rotational drives).
+#define DEFAULT_EXTENT_SIZE                       (2 * MEGABYTE)
 
 // Ratio of free ram to use for the cache by default
-// TODO: DEFAULT_MAX_CACHE_RATIO is unused. Should it be deleted?
-#define DEFAULT_MAX_CACHE_RATIO                   0.5
+#define DEFAULT_MAX_CACHE_RATIO                   2
 
 // The maximum number of concurrently active
 // index writes per merger serializer.
@@ -127,46 +121,12 @@
 // How large can the key be, in bytes?  This value needs to fit in a byte.
 #define MAX_KEY_SIZE                              250
 
-// Any values of this size or less will be directly stored in btree leaf nodes.
-// Values greater than this size will be stored in overflow blocks. This value
-// needs to fit in a byte.
-#define MAX_IN_NODE_VALUE_SIZE                    250
-
-// memcached specifies the maximum value size to be 1MB, but customers asked this to be much higher
-#define MAX_VALUE_SIZE                            (10 * MEGABYTE)
-
-// Values larger than this will be streamed in a get operation
-#define MAX_BUFFERED_GET_SIZE                     MAX_VALUE_SIZE // streaming is too slow for now, so we disable it completely
-
-// If a single connection sends this many 'noreply' commands, the next command will
-// have to wait until the first one finishes
-#define MAX_CONCURRENT_QUERIES_PER_CONNECTION     500
-
-// The number of concurrent queries when loading memcached operations from a file.
-#define MAX_CONCURRENT_QUEURIES_ON_IMPORT         1000
-
-// How many timestamps we store in a leaf node.  We store the
-// NUM_LEAF_NODE_EARLIER_TIMES+1 most-recent timestamps.
-#define NUM_LEAF_NODE_EARLIER_TIMES               4
-
-
 // Special block IDs.  These don't really belong here because they're
 // more magic constants than tunable parameters.
 
 // The btree superblock, which has a reference to the root node block
 // id.
 #define SUPERBLOCK_ID                             0
-
-// The ratio at which we should start GCing.
-#define DEFAULT_GC_HIGH_RATIO                     0.20
-
-// The ratio at which we don't want to keep GC'ing.
-#define DEFAULT_GC_LOW_RATIO                      0.15
-
-// What's the maximum number of "young" extents we can have?
-#define GC_YOUNG_EXTENT_MAX_SIZE                  50
-// What's the definition of a "young" extent in microseconds?
-#define GC_YOUNG_EXTENT_TIMELIMIT_MICROS          50000
 
 // If the size of the LBA on a given disk exceeds LBA_MIN_SIZE_FOR_GC, then the fraction of the
 // entries that are live and not garbage should be at least LBA_MIN_UNGARBAGE_FRACTION.

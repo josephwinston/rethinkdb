@@ -2,8 +2,7 @@
 #ifndef ARCH_IO_DISK_ACCOUNTING_HPP_
 #define ARCH_IO_DISK_ACCOUNTING_HPP_
 
-#include "errors.hpp"
-#include <boost/function.hpp>
+#include <functional>
 
 #include "containers/intrusive_list.hpp"
 #include "containers/scoped.hpp"
@@ -54,7 +53,7 @@ struct accounting_diskmgr_account_t {
 
     void push(action_t *action);
     void on_semaphore_available();
-    semaphore_t *get_outstanding_requests_limiter();
+    co_semaphore_t *get_outstanding_requests_limiter();
 
 private:
     typedef accounting_diskmgr_eager_account_t eager_account_t;
@@ -65,6 +64,8 @@ private:
     int pri;
     int outstanding_requests_limit;
     scoped_ptr_t<eager_account_t> eager_account;
+    // A scoped pointer because we create the drainer lazily on first use.
+    scoped_ptr_t<auto_drainer_t> requests_drainer;
 
     DISABLE_COPYING(accounting_diskmgr_account_t);
 };
@@ -73,6 +74,7 @@ struct accounting_diskmgr_action_t
     : public intrusive_list_node_t<accounting_diskmgr_action_t>,
       public accounting_payload_t {
     accounting_diskmgr_account_t *account;
+    auto_drainer_t::lock_t account_acq;
 };
 
 void debug_print(printf_buffer_t *buf,
@@ -94,7 +96,7 @@ public:
 
     void submit(action_t *a);
 
-    boost::function<void (action_t *)> done_fun;
+    std::function<void (action_t *)> done_fun;
 
     passive_producer_t<accounting_payload_t *> * const producer;
     void done(accounting_payload_t *p);

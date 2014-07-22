@@ -109,6 +109,12 @@ linux_tcp_conn_t::linux_tcp_conn_t(const ip_address_t &peer,
         if (setsockopt(sock.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0)
             logWRN("Failed to set socket reuse to true: %s", errno_string(get_errno()).c_str());
     }
+    {
+        // Disable Nagle algorithm just as in the listener case
+        int sockoptval = 1;
+        int res = setsockopt(sock.get(), IPPROTO_TCP, TCP_NODELAY, &sockoptval, sizeof(sockoptval));
+        guarantee_err(res != -1, "Could not set TCP_NODELAY option");
+    }
 
     int res;
     if (peer.is_ipv4()) {
@@ -152,6 +158,12 @@ linux_tcp_conn_t::linux_tcp_conn_t(fd_t s) :
 
     int res = fcntl(sock.get(), F_SETFL, O_NONBLOCK);
     guarantee_err(res == 0, "Could not make socket non-blocking");
+}
+
+void linux_tcp_conn_t::enable_keepalive() {
+    int optval = 1;
+    int res = setsockopt(sock.get(), SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+    guarantee(res != -1, "Could not set SO_KEEPALIVE option.");
 }
 
 linux_tcp_conn_t::write_buffer_t * linux_tcp_conn_t::get_write_buffer() {
@@ -633,7 +645,7 @@ void linux_tcp_conn_descriptor_t::make_overcomplicated(linux_tcp_conn_t **tcp_co
 /* Network listener object */
 linux_nonthrowing_tcp_listener_t::linux_nonthrowing_tcp_listener_t(
         const std::set<ip_address_t> &bind_addresses, int _port,
-        const boost::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t>&)> &cb) :
+        const std::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t> &)> &cb) :
     callback(cb),
     local_addresses(bind_addresses),
     port(_port),
@@ -785,7 +797,9 @@ bool bind_ipv6_interface(fd_t sock, int *port_out, const ip_address_t &addr) {
         if (get_errno() == EADDRINUSE || get_errno() == EACCES) {
             return false;
         } else {
-            crash("Could not bind socket at localhost:%i - %s\n", *port_out, errno_string(get_errno()).c_str());
+            crash("Could not bind socket at %s:%i - %s\n",
+                  addr.to_string().c_str(), *port_out,
+                  errno_string(get_errno()).c_str());
         }
     }
 
@@ -937,7 +951,7 @@ void linux_nonthrowing_tcp_listener_t::on_event(int) {
     via event_listener.watch(). */
 }
 
-void noop_fun(UNUSED const scoped_ptr_t<linux_tcp_conn_descriptor_t>& arg) { }
+void noop_fun(UNUSED const scoped_ptr_t<linux_tcp_conn_descriptor_t> &arg) { }
 
 linux_tcp_bound_socket_t::linux_tcp_bound_socket_t(const std::set<ip_address_t> &bind_addresses, int port) :
     listener(new linux_nonthrowing_tcp_listener_t(bind_addresses, port, noop_fun))
@@ -952,7 +966,7 @@ int linux_tcp_bound_socket_t::get_port() const {
 }
 
 linux_tcp_listener_t::linux_tcp_listener_t(const std::set<ip_address_t> &bind_addresses, int port,
-    const boost::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t>&)> &callback) :
+    const std::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t> &)> &callback) :
         listener(new linux_nonthrowing_tcp_listener_t(bind_addresses, port, callback))
 {
     if (!listener->begin_listening()) {
@@ -962,7 +976,7 @@ linux_tcp_listener_t::linux_tcp_listener_t(const std::set<ip_address_t> &bind_ad
 
 linux_tcp_listener_t::linux_tcp_listener_t(
     linux_tcp_bound_socket_t *bound_socket,
-    const boost::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t>&)> &callback) :
+    const std::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t> &)> &callback) :
         listener(bound_socket->listener.release())
 {
     listener->callback = callback;
@@ -978,7 +992,7 @@ int linux_tcp_listener_t::get_port() const {
 linux_repeated_nonthrowing_tcp_listener_t::linux_repeated_nonthrowing_tcp_listener_t(
     const std::set<ip_address_t> &bind_addresses,
     int port,
-    const boost::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t>&)> &callback) :
+    const std::function<void(scoped_ptr_t<linux_tcp_conn_descriptor_t> &)> &callback) :
         listener(bind_addresses, port, callback)
 { }
 

@@ -38,13 +38,18 @@ public:
         return uuid.is_nil();
     }
 
+    RDB_DECLARE_ME_SERIALIZABLE;
+
 private:
     friend class connectivity_cluster_t;
 
     uuid_u uuid;
-
-    RDB_MAKE_ME_SERIALIZABLE_1(uuid);
 };
+
+RDB_SERIALIZE_OUTSIDE(peer_id_t);
+
+void serialize_universal(write_message_t *wm, const peer_id_t &peer_id);
+archive_result_t deserialize_universal(read_stream_t *s, peer_id_t *peer_id);
 
 void debug_print(printf_buffer_t *buf, const peer_id_t &peer_id);
 
@@ -52,6 +57,10 @@ struct peers_list_callback_t {
 public:
     peers_list_callback_t() { }
 
+    // As a rule, for a given peer id, these calls arrive in alternating sequence as
+    // long as we're subscribed to them.  (And you should subscribe early enough
+    // (before constructing a connectivity_cluster_t::run_t, in practice) that you
+    // get on_connect first.)
     virtual void on_connect(peer_id_t peer_id) = 0;
     virtual void on_disconnect(peer_id_t peer_id) = 0;
 

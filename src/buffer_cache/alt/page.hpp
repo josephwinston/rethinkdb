@@ -4,6 +4,7 @@
 #include "concurrency/cond_var.hpp"
 #include "containers/backindex_bag.hpp"
 #include "repli_timestamp.hpp"
+#include "serializer/buf_ptr.hpp"
 #include "serializer/types.hpp"
 
 class cache_account_t;
@@ -28,9 +29,8 @@ public:
     // Loads the block for the given block id.
     page_t(block_id_t block_id, page_cache_t *page_cache, cache_account_t *account);
 
-    page_t(block_size_t block_size, scoped_malloc_t<ser_buffer_t> buf,
-           page_cache_t *page_cache);
-    page_t(scoped_malloc_t<ser_buffer_t> buf,
+    page_t(block_id_t block_id, buf_ptr_t buf, page_cache_t *page_cache);
+    page_t(block_id_t block_id, buf_ptr_t buf,
            const counted_t<standard_block_token_t> &token,
            page_cache_t *page_cache);
     page_t(page_t *copyee, page_cache_t *page_cache, cache_account_t *account);
@@ -43,25 +43,46 @@ public:
 
     // These may not be called until the page_acq_t's buf_ready_signal is pulsed.
     void *get_page_buf(page_cache_t *page_cache);
-    void reset_block_token();
-    void set_page_buf_size(block_size_t block_size);
+    void reset_block_token(page_cache_t *page_cache);
+    void set_page_buf_size(block_size_t block_size, page_cache_t *page_cache);
+
     block_size_t get_page_buf_size();
 
     // How much memory the block would use, if it were in memory.  (If the block is
     // already in memory, this is how much memory the block is currently
     // using, of course.)
-    uint32_t hypothetical_memory_usage() const;
 
-    bool is_loading() const { return loader_ != NULL; }
+    uint32_t hypothetical_memory_usage(page_cache_t *page_cache) const;
+    uint64_t access_time() const { return access_time_; }
+
+    bool is_loading() const {
+        return loader_ != NULL && page_t::loader_is_loading(loader_);
+    }
+    bool is_deferred_loading() const {
+        return loader_ != NULL && !page_t::loader_is_loading(loader_);
+    }
     bool has_waiters() const { return !waiters_.empty(); }
-    bool is_evicted() const { return !buf_.has(); }
+    bool is_loaded() const { return buf_.has(); }
     bool is_disk_backed() const { return block_token_.has(); }
 
-    void evict_self();
+    void evict_self(page_cache_t *page_cache);
+
+    block_id_t block_id() const { return block_id_; }
+
+    bool page_ptr_count() const { return snapshot_refcount_; }
+
+    const counted_t<standard_block_token_t> &block_token() const {
+        return block_token_;
+    }
+
+    ser_buffer_t *get_loaded_ser_buffer();
+    void init_block_token(counted_t<standard_block_token_t> token,
+                          page_cache_t *page_cache);
 
 private:
     friend class page_ptr_t;
     friend class deferred_page_loader_t;
+    static bool loader_is_loading(page_loader_t *loader);
     void add_snapshotter();
     void remove_snapshotter(page_cache_t *page_cache);
     size_t num_snapshot_references();
@@ -72,7 +93,7 @@ private:
 
     static void finish_load_with_block_id(page_t *page, page_cache_t *page_cache,
                                           counted_t<standard_block_token_t> block_token,
-                                          scoped_malloc_t<ser_buffer_t> buf);
+                                          buf_ptr_t buf);
 
     static void catch_up_with_deferred_load(
             deferred_page_loader_t *deferred_loader,
@@ -95,21 +116,17 @@ private:
     static void load_using_block_token(page_t *page, page_cache_t *page_cache,
                                        cache_account_t *account);
 
-    friend class page_cache_t;
-    friend class eviction_bag_t;
     friend backindex_bag_index_t *access_backindex(page_t *page);
 
-    // KSI: Explain this more.
-    // One of loader_, buf_, or block_token_ is non-null.
+    // The block id.  Used to (potentially) delete the page_t and current_page_t when
+    // it gets evicted.
+    const block_id_t block_id_;
+
+    // One of loader_, buf_, or block_token_ is non-null.  (Either the page is in
+    // memory, or there is always a way to get the page into memory.)
     page_loader_t *loader_;
 
-    // max_block_size_ is const and named max_block_size_ for now, because we can't
-    // change the in-memory block size of a page (even if we can change the
-    // serialized size).
-    const uint32_t max_ser_block_size_;
-    uint32_t ser_buf_size_;
-
-    scoped_malloc_t<ser_buffer_t> buf_;
+    buf_ptr_t buf_;
     counted_t<standard_block_token_t> block_token_;
 
     uint64_t access_time_;
@@ -120,7 +137,7 @@ private:
 
     // A list of waiters that expect the value to be loaded, and (as long as there
     // are waiters) expect the value to never be evicted.
-    // RSP: This could be a single pointer instead of two.
+    // KSI: This could be a single pointer instead of two.
     intrusive_list_t<page_acq_t> waiters_;
 
     // This page_t's index into its eviction bag (managed by the page_cache_t -- one
@@ -148,34 +165,34 @@ inline backindex_bag_index_t *access_backindex(page_t *page) {
 // A page_ptr_t holds a pointer to a page_t.
 class page_ptr_t {
 public:
-    explicit page_ptr_t(page_t *page, page_cache_t *page_cache)
-        : page_(NULL), page_cache_(NULL) { init(page, page_cache); }
+    explicit page_ptr_t(page_t *page)
+        : page_(NULL) { init(page); }
     page_ptr_t();
 
-    // The page_ptr_t _should_ be reset ()) before the destructor is called, but
-    // it'll work right now without that.  Eventually, reset() will take a
-    // page_cache_t parameter, and the page_cache_ field will be removed.
+    // The page_ptr_t MUST be reset before the destructor is called.
     ~page_ptr_t();
+
+    // You MUST manually call reset_page_ptr() to reset the page_ptr_t.  Then, please
+    // call consider_evicting_current_page if applicable.
+    void reset_page_ptr(page_cache_t *page_cache);
 
     page_ptr_t(page_ptr_t &&movee);
     page_ptr_t &operator=(page_ptr_t &&movee);
 
-    void init(page_t *page, page_cache_t *page_cache);
+    void init(page_t *page);
 
     page_t *get_page_for_read() const;
     page_t *get_page_for_write(page_cache_t *page_cache,
                                cache_account_t *account);
-
-    void reset();
 
     bool has() const {
         return page_ != NULL;
     }
 
 private:
+    void swap_with(page_ptr_t *other);
+
     page_t *page_;
-    // KSI: Get rid of this variable.
-    page_cache_t *page_cache_;
     DISABLE_COPYING(page_ptr_t);
 };
 
@@ -189,11 +206,13 @@ public:
 
     bool has() const;
 
-    void init(repli_timestamp_t timestamp, page_t *page, page_cache_t *page_cache);
+    void init(repli_timestamp_t timestamp, page_t *page);
 
     page_t *get_page_for_read() const;
 
     repli_timestamp_t timestamp() const { return timestamp_; }
+
+    void reset_page_ptr(page_cache_t *page_cache);
 
 private:
     repli_timestamp_t timestamp_;

@@ -17,14 +17,13 @@ json_adapter_if_t::json_adapter_map_t get_json_subfields(blueprint_role_t *);
 cJSON *render_as_json(blueprint_role_t *);
 void apply_json_to(cJSON *, blueprint_role_t *);
 
-template<class protocol_t>
 class persistable_blueprint_t {
 public:
     //TODO if we swap the region_t and peer_id_t's positions in these maps we
     //can get better data structure integrity. It might get a bit tricky
     //though.
 
-    typedef std::map<typename protocol_t::region_t, blueprint_role_t> region_to_role_map_t;
+    typedef std::map<region_t, blueprint_role_t> region_to_role_map_t;
     typedef std::map<machine_id_t, region_to_role_map_t> role_map_t;
 
     role_map_t machines_roles;
@@ -32,21 +31,15 @@ public:
     bool operator==(const persistable_blueprint_t &other) const {
         return machines_roles == other.machines_roles;
     }
-
-    RDB_MAKE_ME_SERIALIZABLE_1(machines_roles);
 };
 
-template <class protocol_t>
-void debug_print(printf_buffer_t *buf, const persistable_blueprint_t<protocol_t> &x);
+RDB_DECLARE_SERIALIZABLE(persistable_blueprint_t);
+
+void debug_print(printf_buffer_t *buf, const persistable_blueprint_t &x);
 
 
-template <class protocol_t>
-json_adapter_if_t::json_adapter_map_t get_json_subfields(persistable_blueprint_t<protocol_t> *);
-
-template <class protocol_t>
-cJSON *render_as_json(persistable_blueprint_t<protocol_t> *);
-
-template <class protocol_t>
-void apply_json_to(cJSON *, persistable_blueprint_t<protocol_t> *);
+json_adapter_if_t::json_adapter_map_t get_json_subfields(persistable_blueprint_t *);
+cJSON *render_as_json(persistable_blueprint_t *);
+void apply_json_to(cJSON *, persistable_blueprint_t *);
 
 #endif /* CLUSTERING_ADMINISTRATION_PERSISTABLE_BLUEPRINT_HPP_ */

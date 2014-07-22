@@ -11,7 +11,6 @@
 #include "arch/types.hpp"
 #include "concurrency/auto_drainer.hpp"
 #include "concurrency/one_per_thread.hpp"
-#include "concurrency/semaphore.hpp"
 #include "containers/archive/tcp_conn_stream.hpp"
 #include "containers/map_sentries.hpp"
 #include "containers/uuid.hpp"
@@ -24,6 +23,7 @@ namespace boost {
 template <class> class optional;
 }
 
+class co_semaphore_t;
 class heartbeat_manager_t;
 
 class peer_address_set_t {
@@ -62,7 +62,7 @@ class connectivity_cluster_t :
 {
 public:
     static const std::string cluster_proto_header;
-    static const std::string cluster_version;
+    static const std::string cluster_version_string;
     static const std::string cluster_arch_bitsize;
     static const std::string cluster_build_mode;
 
@@ -166,7 +166,7 @@ public:
                              boost::optional<peer_id_t> expected_id,
                              auto_drainer_t::lock_t drainer_lock,
                              bool *successful_join,
-                             semaphore_t *rate_control) THROWS_NOTHING;
+                             co_semaphore_t *rate_control) THROWS_NOTHING;
 
         /* `connectivity_cluster_t::join_blocking()` is spawned in a new
         coroutine by `connectivity_cluster_t::join()`. It's also run by

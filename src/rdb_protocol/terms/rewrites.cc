@@ -37,14 +37,14 @@ private:
         return real->is_deterministic();
     }
 
-    virtual counted_t<val_t> term_eval(scope_env_t *env, UNUSED eval_flags_t flags) {
+    virtual counted_t<val_t> term_eval(scope_env_t *env, eval_flags_t) const {
         return real->eval(env);
     }
 
     protob_t<const Term> in;
     protob_t<Term> out;
 
-    counted_t<term_t> real;
+    counted_t<const term_t> real;
 };
 
 class inner_join_term_t : public rewrite_term_t {
@@ -137,16 +137,16 @@ private:
         r::reql_t get_all =
             r::expr(right).get_all(
                 r::expr(left_attr)(row, r::optarg("_SHORTCUT_", GET_FIELD_SHORTCUT)));
-
         get_all.copy_optargs_from_term(*optargs_in);
+        return r::expr(left).concat_map(
+            r::fun(row,
+                   r::branch(
+                       r::null() == row,
+                       r::array(),
+                       std::move(get_all).default_(r::array()).map(
+                           r::fun(v, r::object(r::optarg("left", row),
+                                               r::optarg("right", v)))))));
 
-        return
-            r::expr(left).concat_map(
-                r::fun(row,
-                    std::move(get_all).map(
-                        r::fun(v,
-                            r::object(r::optarg("left", row),
-                                      r::optarg("right", v))))));
     }
     virtual const char *name() const { return "inner_join"; }
 };

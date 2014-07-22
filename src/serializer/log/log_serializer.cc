@@ -5,14 +5,17 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
 #include <functional>
 
 #include "arch/io/disk.hpp"
 #include "arch/runtime/runtime.hpp"
 #include "arch/runtime/coroutines.hpp"
 #include "buffer_cache/types.hpp"
+#include "concurrency/new_mutex.hpp"
 #include "logger.hpp"
 #include "perfmon/perfmon.hpp"
+#include "serializer/buf_ptr.hpp"
 #include "serializer/log/data_block_manager.hpp"
 
 filepath_file_opener_t::filepath_file_opener_t(const serializer_filepath_t &filepath,
@@ -69,11 +72,12 @@ void filepath_file_opener_t::move_serializer_file_to_permanent_location() {
     const int res = ::rename(temporary_file_name().c_str(), file_name().c_str());
 
     if (res != 0) {
-        crash("Could not rename database file %s to permanent location %s\n",
-              temporary_file_name().c_str(), file_name().c_str());
+        crash("Could not rename database file %s to permanent location %s (%s)\n",
+              temporary_file_name().c_str(), file_name().c_str(),
+              errno_string(errno).c_str());
     }
 
-    guarantee_fsync_parent_directory(file_name().c_str());
+    warn_fsync_parent_directory(file_name().c_str());
 
     opened_temporary_ = false;
 }
@@ -237,9 +241,11 @@ struct ls_start_existing_fsm_t :
 
             ser->metablock_manager = new mb_manager_t(ser->extent_manager);
             ser->lba_index = new lba_list_t(ser->extent_manager,
-                    std::bind(&log_serializer_t::write_metablock, ser,
-                              std::placeholders::_1, std::placeholders::_2));
-            ser->data_block_manager = new data_block_manager_t(&ser->dynamic_config, ser->extent_manager, ser, &ser->static_config, ser->stats.get());
+                    std::bind(&log_serializer_t::write_metablock_sans_pipelining,
+                              ser, ph::_1, ph::_2));
+            ser->data_block_manager
+                = new data_block_manager_t(ser->extent_manager, ser,
+                                           &ser->static_config, ser->stats.get());
 
             // STATE E
             if (ser->metablock_manager->start_existing(ser->dbfile, &metablock_found, &metablock_buffer, this)) {
@@ -406,8 +412,8 @@ file_account_t *log_serializer_t::make_io_account(int priority, int outstanding_
     return new file_account_t(dbfile, priority, outstanding_requests_limit);
 }
 
-void log_serializer_t::block_read(const counted_t<ls_block_token_pointee_t> &token,
-                                  ser_buffer_t *buf, file_account_t *io_account) {
+buf_ptr_t log_serializer_t::block_read(const counted_t<ls_block_token_pointee_t> &token,
+                                     file_account_t *io_account) {
     assert_thread();
     guarantee(token.has());
     guarantee(state == state_ready);
@@ -415,10 +421,11 @@ void log_serializer_t::block_read(const counted_t<ls_block_token_pointee_t> &tok
     ticks_t pm_time;
     stats->pm_serializer_block_reads.begin(&pm_time);
 
-    data_block_manager->read(token->offset_, token->block_size().ser_value(),
-                             buf, io_account);
+    buf_ptr_t ret = data_block_manager->read(token->offset_, token->block_size(),
+                                           io_account);
 
     stats->pm_serializer_block_reads.end(&pm_time);
+    return ret;
 }
 
 // God this is such a hack.
@@ -429,7 +436,7 @@ get_ls_block_token(const counted_t<ls_block_token_pointee_t> &tok) {
 }
 #else
 counted_t<ls_block_token_pointee_t>
-get_ls_block_token(const counted_t<scs_block_token_t<log_serializer_t> >& tok) {
+get_ls_block_token(const counted_t<scs_block_token_t<log_serializer_t> > &tok) {
     if (tok) {
         return tok->inner_token;
     } else {
@@ -439,7 +446,9 @@ get_ls_block_token(const counted_t<scs_block_token_t<log_serializer_t> >& tok) {
 #endif  // SEMANTIC_SERIALIZER_CHECK
 
 
-void log_serializer_t::index_write(const std::vector<index_write_op_t> &write_ops, file_account_t *io_account) {
+void log_serializer_t::index_write(new_mutex_in_line_t *mutex_acq,
+                                   const std::vector<index_write_op_t> &write_ops,
+                                   file_account_t *io_account) {
     assert_thread();
     ticks_t pm_time;
     stats->pm_serializer_index_writes.begin(&pm_time);
@@ -457,7 +466,7 @@ void log_serializer_t::index_write(const std::vector<index_write_op_t> &write_op
         for (std::vector<index_write_op_t>::const_iterator write_op_it = write_ops.begin();
              write_op_it != write_ops.end();
              ++write_op_it) {
-            const index_write_op_t& op = *write_op_it;
+            const index_write_op_t &op = *write_op_it;
             flagged_off64_t offset = lba_index->get_block_offset(op.block_id);
             uint32_t ser_block_size = lba_index->get_ser_block_size(op.block_id);
 
@@ -493,7 +502,7 @@ void log_serializer_t::index_write(const std::vector<index_write_op_t> &write_op
         }
     }
 
-    index_write_finish(&txn, io_account);
+    index_write_finish(mutex_acq, &txn, io_account);
 
     stats->pm_serializer_index_writes.end(&pm_time);
 }
@@ -509,7 +518,9 @@ void log_serializer_t::index_write_prepare(extent_transaction_t *txn) {
     extent_manager->begin_transaction(txn);
 }
 
-void log_serializer_t::index_write_finish(extent_transaction_t *txn, file_account_t *io_account) {
+void log_serializer_t::index_write_finish(new_mutex_in_line_t *mutex_acq,
+                                          extent_transaction_t *txn,
+                                          file_account_t *io_account) {
     /* Sync the LBA */
     struct : public cond_t, public lba_list_t::sync_callback_t {
         void on_lba_sync() { pulse(); }
@@ -521,7 +532,7 @@ void log_serializer_t::index_write_finish(extent_transaction_t *txn, file_accoun
     extent_manager->end_transaction(txn);
 
     /* Write the metablock */
-    write_metablock(on_lba_sync, io_account);
+    write_metablock(mutex_acq, &on_lba_sync, io_account);
 
     active_write_count--;
 
@@ -542,7 +553,8 @@ void log_serializer_t::index_write_finish(extent_transaction_t *txn, file_accoun
     }
 }
 
-void log_serializer_t::write_metablock(const signal_t &safe_to_write_cond,
+void log_serializer_t::write_metablock(new_mutex_in_line_t *mutex_acq,
+                                       const signal_t *safe_to_write_cond,
                                        file_account_t *io_account) {
     assert_thread();
     metablock_t mb_buffer;
@@ -557,8 +569,14 @@ void log_serializer_t::write_metablock(const signal_t &safe_to_write_cond,
     cond_t on_prev_write_submitted_metablock;
     metablock_waiter_queue.push_back(&on_prev_write_submitted_metablock);
 
-    safe_to_write_cond.wait();
-    if (waiting_for_prev_write) on_prev_write_submitted_metablock.wait();
+    // This operation is in line with the metablock manager.  Now another index write
+    // may commence.
+    mutex_acq->reset();
+
+    safe_to_write_cond->wait();
+    if (waiting_for_prev_write) {
+        on_prev_write_submitted_metablock.wait();
+    }
     guarantee(metablock_waiter_queue.front() == &on_prev_write_submitted_metablock);
 
     struct : public cond_t, public mb_manager_t::metablock_write_callback_t {
@@ -577,6 +595,13 @@ void log_serializer_t::write_metablock(const signal_t &safe_to_write_cond,
     }
 
     if (!done_with_metablock) on_metablock_write.wait();
+}
+
+void log_serializer_t::write_metablock_sans_pipelining(const signal_t *safe_to_write_cond,
+                                                       file_account_t *io_account) {
+    new_mutex_in_line_t dummy_acq;
+    write_metablock(&dummy_acq, safe_to_write_cond, io_account);
+
 }
 
 counted_t<ls_block_token_pointee_t>
@@ -685,8 +710,8 @@ void log_serializer_t::remap_block_to_new_offset(int64_t current_offset, int64_t
     }
 }
 
-block_size_t log_serializer_t::max_block_size() const {
-    return static_config.block_size();
+max_block_size_t log_serializer_t::max_block_size() const {
+    return static_config.max_block_size();
 }
 
 bool log_serializer_t::coop_lock_and_check() {
@@ -810,9 +835,18 @@ bool log_serializer_t::next_shutdown_step() {
         delete extent_manager;
         extent_manager = NULL;
 
-        delete dbfile;
-        dbfile = NULL;
+        shutdown_state = shutdown_waiting_on_dbfile_destruction;
+        coro_t::spawn_sometime(std::bind(&log_serializer_t::delete_dbfile_and_continue_shutdown,
+                                         this));
+        // TODO: Get rid of the useless shutdown_in_one_shot variable -- we never
+        // shut down in one shot.
+        shutdown_in_one_shot = false;
+        return false;
+    }
 
+    rassert(dbfile == NULL);
+
+    if (shutdown_state == shutdown_waiting_on_dbfile_destruction) {
         state = state_shut_down;
 
         // Don't call the callback if we went through the entire
@@ -826,6 +860,13 @@ bool log_serializer_t::next_shutdown_step() {
 
     unreachable("Invalid state.");
     return true; // make compiler happy
+}
+
+void log_serializer_t::delete_dbfile_and_continue_shutdown() {
+    rassert(dbfile != NULL);
+    delete dbfile;
+    dbfile = NULL;
+    next_shutdown_step();
 }
 
 void log_serializer_t::on_datablock_manager_shutdown() {
@@ -876,11 +917,11 @@ void log_serializer_t::unregister_read_ahead_cb(serializer_read_ahead_callback_t
 
 void log_serializer_t::offer_buf_to_read_ahead_callbacks(
         block_id_t block_id,
-        scoped_malloc_t<ser_buffer_t> &&buf,
+        buf_ptr_t &&buf,
         const counted_t<standard_block_token_t> &token) {
     assert_thread();
 
-    scoped_malloc_t<ser_buffer_t> local_buf = std::move(buf);
+    buf_ptr_t local_buf = std::move(buf);
     for (size_t i = 0; local_buf.has() && i < read_ahead_callbacks.size(); ++i) {
         read_ahead_callbacks[i]->offer_read_ahead_buf(block_id,
                                                       &local_buf,
@@ -919,39 +960,32 @@ void debug_print(printf_buffer_t *buf,
     }
 }
 
-void adjust_ref(ls_block_token_pointee_t *p, int adjustment) {
-    struct adjuster_t : public linux_thread_message_t {
-        void on_thread_switch() {
-            rassert(p->ref_count_ + adjustment >= 0);
-            p->ref_count_ += adjustment;
-            if (p->ref_count_ == 0) {
-                p->do_destroy();
-            }
-            delete this;
-        }
-        ls_block_token_pointee_t *p;
-        int adjustment;
-    };
-
-    if (get_thread_id() == p->serializer_->home_thread()) {
-        rassert(p->ref_count_ + adjustment >= 0);
-        p->ref_count_ += adjustment;
-        if (p->ref_count_ == 0) {
-            p->do_destroy();
-        }
-    } else {
-        adjuster_t *adjuster = new adjuster_t;
-        adjuster->p = p;
-        adjuster->adjustment = adjustment;
-        DEBUG_VAR bool res = continue_on_thread(p->serializer_->home_thread(), adjuster);
-        rassert(!res);
-    }
-}
-
 void counted_add_ref(ls_block_token_pointee_t *p) {
-    adjust_ref(p, 1);
+    DEBUG_VAR intptr_t res = __sync_add_and_fetch(&p->ref_count_, 1);
+    rassert(res > 0);
 }
 
 void counted_release(ls_block_token_pointee_t *p) {
-    adjust_ref(p, -1);
+    struct destroyer_t : public linux_thread_message_t {
+        void on_thread_switch() {
+            rassert(p->ref_count_ == 0);
+            p->do_destroy();
+            delete this;
+        }
+        ls_block_token_pointee_t *p;
+    };
+
+    intptr_t res = __sync_sub_and_fetch(&p->ref_count_, 1);
+    rassert(res >= 0);
+    if (res == 0) {
+        if (get_thread_id() == p->serializer_->home_thread()) {
+            p->do_destroy();
+        } else {
+            destroyer_t *destroyer = new destroyer_t;
+            destroyer->p = p;
+            DEBUG_VAR bool cont = continue_on_thread(p->serializer_->home_thread(),
+                                                     destroyer);
+            rassert(!cont);
+        }
+    }
 }

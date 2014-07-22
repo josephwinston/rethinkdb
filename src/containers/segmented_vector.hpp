@@ -41,6 +41,19 @@ public:
         return size_ == 0;
     }
 
+    // Gets an element, without creating a segment_t if its segment doesn't exist.
+    // (Thus, this method doesn't return a reference.)
+    element_t get_sparsely(size_t index) const {
+        guarantee(index < size_, "index = %zu, size_ = %zu", index, size_);
+        const size_t segment_index = index / ELEMENTS_PER_SEGMENT;
+        segment_t *seg = segments_[segment_index];
+        if (seg == NULL) {
+            return element_t();
+        } else {
+            return seg->elements[index % ELEMENTS_PER_SEGMENT];
+        }
+    }
+
     element_t &operator[](size_t index) {
         return get_element(index);
     }
@@ -70,16 +83,24 @@ public:
         set_size(size_ - 1);
     }
 
+    void resize_with_zeros(size_t new_size) {
+        set_size(new_size);
+    }
+
 private:
     // Gets a non-const element with a const function... which breaks the guarantees
     // but compiles and lets this be called by both the const and non-const versions
     // of operator[].
     element_t &get_element(size_t index) const {
         guarantee(index < size_, "index = %zu, size_ = %zu", index, size_);
-        segment_t *seg = segments_[index / ELEMENTS_PER_SEGMENT];
+        const size_t segment_index = index / ELEMENTS_PER_SEGMENT;
+        segment_t *seg = segments_[segment_index];
+        if (seg == NULL) {
+            seg = new segment_t();
+            segments_[segment_index] = seg;
+        }
         return seg->elements[index % ELEMENTS_PER_SEGMENT];
     }
-
 
     // Note: sometimes elements will be initialized before you ask the
     // array to grow to that size (e.g. one hundred elements might be
@@ -96,17 +117,18 @@ private:
             segments_.pop_back();
         }
         while (segments_.size() < new_num_segs) {
-            segments_.push_back(new segment_t);
+            segments_.push_back(NULL);
         }
 
         size_ = new_size;
     }
 
     struct segment_t {
+        segment_t() : elements() { }  // Zero-initialize array.
         element_t elements[ELEMENTS_PER_SEGMENT];
     };
 
-    std::vector<segment_t *> segments_;
+    mutable std::vector<segment_t *> segments_;
     size_t size_;
 
     DISABLE_COPYING(segmented_vector_t);

@@ -1,7 +1,27 @@
-$LOAD_PATH.unshift '../../drivers/ruby/lib'
-$LOAD_PATH.unshift '../../build/drivers/ruby/rdb_protocol'
 require 'pp'
-require 'rethinkdb'
+
+# -- import the called-for rethinkdb module
+if ENV['RUBY_DRIVER_DIR']
+  $LOAD_PATH.unshift ENV['RUBY_DRIVER_DIR']
+  require 'rethinkdb'
+  $LOAD_PATH.shift
+else
+  # look for the source directory
+  targetPath = File.expand_path(File.dirname(__FILE__))
+  while targetPath != File::Separator
+    sourceDir = File.join(targetPath, 'drivers', 'ruby')
+    if File.directory?(sourceDir)
+      if system("make -C " + sourceDir) != 0
+        abort "Unable to build the ruby driver at: " + sourceDir
+      end
+      $LOAD_PATH.unshift = File.join(sourceDir, 'lib');
+      require 'rethinkdb'
+      $LOAD_PATH.shift
+      break
+    end
+    targetPath = File.dirname(targetPath)
+  end
+end
 extend RethinkDB::Shortcuts
 
 JSPORT = ARGV[0]
@@ -139,7 +159,10 @@ $defines = eval_env
 # $js_conn = RethinkDB::Connection.new('localhost', JSPORT)
 
 $cpp_conn = RethinkDB::Connection.new(:host => 'localhost', :port => CPPPORT)
-r.db_create('test').run($cpp_conn)
+begin
+  r.db_create('test').run($cpp_conn)
+rescue
+end
 
 $test_count = 0
 $success_count = 0

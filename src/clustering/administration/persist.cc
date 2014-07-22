@@ -4,9 +4,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "errors.hpp"
+#include <boost/bind.hpp>
+
 #include "arch/runtime/thread_pool.hpp"
 #include "buffer_cache/alt/alt.hpp"
 #include "buffer_cache/alt/blob.hpp"
+#include "buffer_cache/alt/cache_balancer.hpp"
 #include "containers/archive/buffer_group_stream.hpp"
 #include "clustering/immediate_consistency/branch/history.hpp"
 #include "serializer/config.hpp"
@@ -31,20 +35,50 @@ struct cluster_metadata_superblock_t {
     char metadata_blob[METADATA_BLOB_MAXREFLEN];
 
     static const int BRANCH_HISTORY_BLOB_MAXREFLEN = 500;
-    char dummy_branch_history_blob[BRANCH_HISTORY_BLOB_MAXREFLEN];
-    char memcached_branch_history_blob[BRANCH_HISTORY_BLOB_MAXREFLEN];
     char rdb_branch_history_blob[BRANCH_HISTORY_BLOB_MAXREFLEN];
 };
 
-/* Etymology: (R)ethink(D)B (m)eta(d)ata */
-const block_magic_t expected_magic = { { 'R', 'D', 'm', 'd' } };
+// Etymology: (R)ethink(D)B (m)eta(d)ata
+// Yes, v1_13 magic is the same for both cluster and auth metadata.
+template <cluster_version_t>
+struct cluster_metadata_magic_t {
+    static const block_magic_t value;
+};
 
-template <class T>
+template <>
+const block_magic_t
+    cluster_metadata_magic_t<cluster_version_t::v1_13_is_latest_disk>::value
+    = { { 'R', 'D', 'm', 'd' } };
+
+template <cluster_version_t>
+struct auth_metadata_magic_t {
+    static const block_magic_t value;
+};
+
+template <>
+const block_magic_t auth_metadata_magic_t<cluster_version_t::v1_13_is_latest_disk>::value
+    = { { 'R', 'D', 'm', 'd' } };
+
+cluster_version_t auth_superblock_version(const auth_metadata_superblock_t *sb) {
+    if (sb->magic
+        == auth_metadata_magic_t<cluster_version_t::v1_13_is_latest_disk>::value) {
+        return cluster_version_t::v1_13_is_latest_disk;
+    } else {
+        crash("auth_metadata_superblock_t has invalid magic.");
+    }
+}
+
+// This only takes a cluster_version_t parameter to get people thinking -- you have
+// to use LATEST_DISK.
+template <cluster_version_t W, class T>
 static void write_blob(buf_parent_t parent, char *ref, int maxreflen,
                        const T &value) {
-    write_message_t msg;
-    msg << value;
-    intrusive_list_t<write_buffer_t> *buffers = msg.unsafe_expose_buffers();
+    static_assert(W == cluster_version_t::LATEST_DISK,
+                  "You must serialize with the latest version.  Make sure to update "
+                  "the rest of the blob, too!");
+    write_message_t wm;
+    serialize<W>(&wm, value);
+    intrusive_list_t<write_buffer_t> *buffers = wm.unsafe_expose_buffers();
     size_t slen = 0;
     for (write_buffer_t *p = buffers->head(); p != NULL; p = buffers->next(p)) {
         slen += p->size;
@@ -55,7 +89,7 @@ static void write_blob(buf_parent_t parent, char *ref, int maxreflen,
         str.append(p->data, p->size);
     }
     guarantee(str.size() == slen);
-    blob_t blob(parent.cache()->get_block_size(), ref, maxreflen);
+    blob_t blob(parent.cache()->max_block_size(), ref, maxreflen);
     blob.clear(parent);
     blob.append_region(parent, str.size());
     blob.write_from_string(str, parent, 0);
@@ -63,16 +97,98 @@ static void write_blob(buf_parent_t parent, char *ref, int maxreflen,
 }
 
 template<class T>
-static void read_blob(buf_parent_t parent, const char *ref, int maxreflen,
+static void read_blob(cluster_version_t cluster_version,
+                      buf_parent_t parent, const char *ref, int maxreflen,
                       T *value_out) {
-    blob_t blob(parent.cache()->get_block_size(),
-                     const_cast<char *>(ref), maxreflen);
+    blob_t blob(parent.cache()->max_block_size(),
+                const_cast<char *>(ref), maxreflen);
     blob_acq_t acq_group;
     buffer_group_t group;
     blob.expose_all(parent, access_t::read, &group, &acq_group);
     buffer_group_read_stream_t ss(const_view(&group));
-    archive_result_t res = deserialize(&ss, value_out);
+    archive_result_t res = deserialize_for_version(cluster_version, &ss, value_out);
     guarantee_deserialization(res, "T (template code)");
+}
+
+
+cluster_version_t cluster_superblock_version(const cluster_metadata_superblock_t *sb) {
+    if (sb->magic
+        == cluster_metadata_magic_t<cluster_version_t::v1_13_is_latest_disk>::value) {
+        return cluster_version_t::v1_13_is_latest_disk;
+    } else {
+        crash("cluster_metadata_superblock_t has invalid magic.");
+    }
+}
+
+void read_metadata_blob(buf_parent_t sb_buf,
+                        const cluster_metadata_superblock_t *sb,
+                        cluster_semilattice_metadata_t *out) {
+    read_blob(cluster_superblock_version(sb),
+              sb_buf,
+              sb->metadata_blob,
+              cluster_metadata_superblock_t::METADATA_BLOB_MAXREFLEN,
+              out);
+}
+
+// As with write_blob, the template parameter must be cluster_version_t::LATEST_DISK.
+// Use bring_up_to_date before calling this.
+template <cluster_version_t W>
+void write_metadata_blob(buf_parent_t sb_buf,
+                         cluster_metadata_superblock_t *sb,
+                         const cluster_semilattice_metadata_t &metadata) {
+    guarantee(cluster_superblock_version(sb) == W);
+    write_blob<W>(sb_buf,
+                  sb->metadata_blob,
+                  cluster_metadata_superblock_t::METADATA_BLOB_MAXREFLEN,
+                  metadata);
+}
+
+void read_branch_history_blob(buf_parent_t sb_buf,
+                              const cluster_metadata_superblock_t *sb,
+                              branch_history_t *out) {
+    read_blob(cluster_superblock_version(sb),
+              sb_buf,
+              sb->rdb_branch_history_blob,
+              cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
+              out);
+}
+
+// As with write_blob, the template parameter must be cluster_version_t::LATEST_DISK.
+// Use bring_up_to_date before calling this.
+template <cluster_version_t W>
+void write_branch_history_blob(buf_parent_t sb_buf,
+                               cluster_metadata_superblock_t *sb,
+                               const branch_history_t &history) {
+    guarantee(cluster_superblock_version(sb) == W);
+    write_blob<W>(sb_buf,
+                  sb->rdb_branch_history_blob,
+                  cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
+                  history);
+}
+
+void bring_up_to_date(
+        buf_parent_t sb_buf,
+        cluster_metadata_superblock_t *sb) {
+    if (cluster_superblock_version(sb) == cluster_version_t::LATEST_DISK) {
+        // Usually we're already up to date.
+        return;
+    }
+
+    cluster_semilattice_metadata_t metadata;
+    read_metadata_blob(sb_buf, sb, &metadata);
+
+    branch_history_t branch_history;
+    read_branch_history_blob(sb_buf, sb, &branch_history);
+
+    // Now that we've read everything, do writes of anything whose serialization may
+    // have changed between versions.
+
+    // (We must write the magic _first_ to appease the assertions in
+    // write_metadata_blob and write_branch_history_blob that check we've called
+    // bring_up_to_date.)
+    sb->magic = cluster_metadata_magic_t<cluster_version_t::LATEST_DISK>::value;
+    write_metadata_blob<cluster_version_t::LATEST_DISK>(sb_buf, sb, metadata);
+    write_branch_history_blob<cluster_version_t::LATEST_DISK>(sb_buf, sb, branch_history);
 }
 
 template <class metadata_t>
@@ -98,7 +214,7 @@ persistent_file_t<metadata_t>::~persistent_file_t() {
 
 template <class metadata_t>
 block_size_t persistent_file_t<metadata_t>::get_cache_block_size() const {
-    return cache->get_block_size();
+    return cache->max_block_size();
 }
 
 template <class metadata_t>
@@ -121,9 +237,8 @@ void persistent_file_t<metadata_t>::construct_serializer_and_cache(const bool cr
     }
 
     {
-        alt_cache_config_t cache_dynamic_config;
-        cache_dynamic_config.page_config.memory_limit = MEGABYTE;
-        cache.init(new cache_t(serializer.get(), cache_dynamic_config, perfmon_parent));
+        balancer.init(new dummy_cache_balancer_t(MEGABYTE));
+        cache.init(new cache_t(serializer.get(), balancer.get(), perfmon_parent));
         cache_conn.init(new cache_conn_t(cache.get()));
     }
 
@@ -171,12 +286,15 @@ auth_persistent_file_t::auth_persistent_file_t(io_backender_t *io_backender,
     auth_metadata_superblock_t *sb
         = static_cast<auth_metadata_superblock_t *>(sb_write.get_data_write());
     memset(sb, 0, get_cache_block_size().value());
-    sb->magic = expected_magic;
+    sb->magic = auth_metadata_magic_t<cluster_version_t::LATEST_DISK>::value;
 
-    write_blob(buf_parent_t(&superblock),
-               sb->metadata_blob,
-               auth_metadata_superblock_t::METADATA_BLOB_MAXREFLEN,
-               initial_metadata);
+    write_blob<cluster_version_t::LATEST_DISK>(
+            buf_parent_t(&superblock),
+            sb->metadata_blob,
+            auth_metadata_superblock_t::METADATA_BLOB_MAXREFLEN,
+            initial_metadata);
+
+    rassert(auth_superblock_version(sb) == cluster_version_t::LATEST_DISK);
 }
 
 auth_persistent_file_t::~auth_persistent_file_t() {
@@ -192,7 +310,8 @@ auth_semilattice_metadata_t auth_persistent_file_t::read_metadata() {
     const auth_metadata_superblock_t *sb
         = static_cast<const auth_metadata_superblock_t *>(sb_read.get_data_read());
     auth_semilattice_metadata_t metadata;
-    read_blob(buf_parent_t(&superblock), sb->metadata_blob,
+    read_blob(auth_superblock_version(sb),
+              buf_parent_t(&superblock), sb->metadata_blob,
               auth_metadata_superblock_t::METADATA_BLOB_MAXREFLEN, &metadata);
     return metadata;
 }
@@ -210,8 +329,13 @@ void auth_persistent_file_t::update_metadata(const auth_semilattice_metadata_t &
 
     auth_metadata_superblock_t *sb
         = static_cast<auth_metadata_superblock_t *>(sb_write.get_data_write());
-    write_blob(buf_parent_t(&superblock), sb->metadata_blob,
-               auth_metadata_superblock_t::METADATA_BLOB_MAXREFLEN, metadata);
+    // There is just one metadata_blob in auth_metadata_superblock_t (for now), so it
+    // suffices to serialize with the latest version.
+    sb->magic = auth_metadata_magic_t<cluster_version_t::LATEST_DISK>::value;
+
+    write_blob<cluster_version_t::LATEST_DISK>(
+            buf_parent_t(&superblock), sb->metadata_blob,
+            auth_metadata_superblock_t::METADATA_BLOB_MAXREFLEN, metadata);
 }
 
 cluster_persistent_file_t::cluster_persistent_file_t(io_backender_t *io_backender,
@@ -237,24 +361,14 @@ cluster_persistent_file_t::cluster_persistent_file_t(io_backender_t *io_backende
         = static_cast<cluster_metadata_superblock_t *>(sb_write.get_data_write());
 
     memset(sb, 0, get_cache_block_size().value());
-    sb->magic = expected_magic;
+    sb->magic = cluster_metadata_magic_t<cluster_version_t::LATEST_DISK>::value;
     sb->machine_id = machine_id;
-    write_blob(buf_parent_t(&superblock),
-               sb->metadata_blob,
-               cluster_metadata_superblock_t::METADATA_BLOB_MAXREFLEN,
-               initial_metadata);
-    write_blob(buf_parent_t(&superblock),
-               sb->dummy_branch_history_blob,
-               cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
-               branch_history_t<mock::dummy_protocol_t>());
-    write_blob(buf_parent_t(&superblock),
-               sb->memcached_branch_history_blob,
-               cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
-               branch_history_t<memcached_protocol_t>());
-    write_blob(buf_parent_t(&superblock),
-               sb->rdb_branch_history_blob,
-               cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
-               branch_history_t<rdb_protocol_t>());
+    write_metadata_blob<cluster_version_t::LATEST_DISK>(
+            buf_parent_t(&superblock), sb, initial_metadata);
+    write_branch_history_blob<cluster_version_t::LATEST_DISK>(
+            buf_parent_t(&superblock),
+            sb,
+            branch_history_t());
 
     construct_branch_history_managers(true);
 }
@@ -273,8 +387,7 @@ cluster_semilattice_metadata_t cluster_persistent_file_t::read_metadata() {
     const cluster_metadata_superblock_t *sb
         = static_cast<const cluster_metadata_superblock_t *>(sb_read.get_data_read());
     cluster_semilattice_metadata_t metadata;
-    read_blob(buf_parent_t(&superblock), sb->metadata_blob,
-              cluster_metadata_superblock_t::METADATA_BLOB_MAXREFLEN, &metadata);
+    read_metadata_blob(buf_parent_t(&superblock), sb, &metadata);
     return metadata;
 }
 
@@ -286,8 +399,9 @@ void cluster_persistent_file_t::update_metadata(const cluster_semilattice_metada
     buf_write_t sb_write(&superblock);
     cluster_metadata_superblock_t *sb
         = static_cast<cluster_metadata_superblock_t *>(sb_write.get_data_write());
-    write_blob(buf_parent_t(&superblock), sb->metadata_blob,
-               cluster_metadata_superblock_t::METADATA_BLOB_MAXREFLEN, metadata);
+    bring_up_to_date(buf_parent_t(&superblock), sb);
+    write_metadata_blob<cluster_version_t::LATEST_DISK>(
+            buf_parent_t(&superblock), sb, metadata);
 }
 
 machine_id_t cluster_persistent_file_t::read_machine_id() {
@@ -301,14 +415,11 @@ machine_id_t cluster_persistent_file_t::read_machine_id() {
     return sb->machine_id;
 }
 
-template <class protocol_t>
-class cluster_persistent_file_t::persistent_branch_history_manager_t : public branch_history_manager_t<protocol_t> {
+class cluster_persistent_file_t::persistent_branch_history_manager_t : public branch_history_manager_t {
 public:
     persistent_branch_history_manager_t(cluster_persistent_file_t *p,
-                                        char (cluster_metadata_superblock_t::*fn)[cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN],
-                                        bool create) :
-        parent(p), field_name(fn)
-    {
+                                        bool create)
+        : parent(p) {
         /* If we're not creating, we have to load the existing branch history
         database from disk */
         if (!create) {
@@ -319,15 +430,15 @@ public:
             buf_read_t sb_read(&superblock);
             const cluster_metadata_superblock_t *sb
                 = static_cast<const cluster_metadata_superblock_t *>(sb_read.get_data_read());
-            read_blob(buf_parent_t(&superblock), sb->*field_name,
-                      cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN,
-                      &bh);
+            read_branch_history_blob(buf_parent_t(&superblock),
+                                     sb,
+                                     &bh);
         }
     }
 
-    branch_birth_certificate_t<protocol_t> get_branch(branch_id_t branch) THROWS_NOTHING {
+    branch_birth_certificate_t get_branch(branch_id_t branch) THROWS_NOTHING {
         home_thread_mixin_t::assert_thread();
-        typename std::map<branch_id_t, branch_birth_certificate_t<protocol_t> >::const_iterator it = bh.branches.find(branch);
+        std::map<branch_id_t, branch_birth_certificate_t>::const_iterator it = bh.branches.find(branch);
         guarantee(it != bh.branches.end(), "no such branch");
         return it->second;
     }
@@ -335,9 +446,9 @@ public:
     std::set<branch_id_t> known_branches() THROWS_NOTHING {
         std::set<branch_id_t> res;
 
-        for (typename std::map<branch_id_t, branch_birth_certificate_t<protocol_t> >::iterator it  = bh.branches.begin();
-                                                                                               it != bh.branches.end();
-                                                                                               ++it) {
+        for (std::map<branch_id_t, branch_birth_certificate_t>::iterator it = bh.branches.begin();
+             it != bh.branches.end();
+             ++it) {
             res.insert(it->first);
         }
 
@@ -345,17 +456,17 @@ public:
     }
 
     void create_branch(branch_id_t branch_id,
-                       const branch_birth_certificate_t<protocol_t> &bc,
+                       const branch_birth_certificate_t &bc,
                        signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) {
         home_thread_mixin_t::assert_thread();
-        std::pair<typename std::map<branch_id_t, branch_birth_certificate_t<protocol_t> >::iterator, bool>
+        std::pair<std::map<branch_id_t, branch_birth_certificate_t>::iterator, bool>
             insert_res = bh.branches.insert(std::make_pair(branch_id, bc));
         guarantee(insert_res.second);
         flush(interruptor);
     }
 
     void export_branch_history(branch_id_t branch,
-                               branch_history_t<protocol_t> *out) THROWS_NOTHING {
+                               branch_history_t *out) THROWS_NOTHING {
         home_thread_mixin_t::assert_thread();
         std::set<branch_id_t> to_process;
         if (out->branches.count(branch) == 0) {
@@ -364,11 +475,11 @@ public:
         while (!to_process.empty()) {
             branch_id_t next = *to_process.begin();
             to_process.erase(next);
-            branch_birth_certificate_t<protocol_t> bc = get_branch(next);
-            std::pair<typename std::map<branch_id_t, branch_birth_certificate_t<protocol_t> >::iterator, bool>
+            branch_birth_certificate_t bc = get_branch(next);
+            std::pair<std::map<branch_id_t, branch_birth_certificate_t>::iterator, bool>
                 insert_res = out->branches.insert(std::make_pair(next, bc));
             guarantee(insert_res.second);
-            for (typename region_map_t<protocol_t, version_range_t>::const_iterator it = bc.origin.begin(); it != bc.origin.end(); it++) {
+            for (region_map_t<version_range_t>::const_iterator it = bc.origin.begin(); it != bc.origin.end(); it++) {
                 if (!it->second.latest.branch.is_nil() && out->branches.count(it->second.latest.branch) == 0) {
                     to_process.insert(it->second.latest.branch);
                 }
@@ -376,10 +487,10 @@ public:
         }
     }
 
-    void import_branch_history(const branch_history_t<protocol_t> &new_records,
+    void import_branch_history(const branch_history_t &new_records,
                                signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) {
         home_thread_mixin_t::assert_thread();
-        for (typename std::map<branch_id_t, branch_birth_certificate_t<protocol_t> >::const_iterator it = new_records.branches.begin(); it != new_records.branches.end(); it++) {
+        for (std::map<branch_id_t, branch_birth_certificate_t>::const_iterator it = new_records.branches.begin(); it != new_records.branches.end(); it++) {
             bh.branches.insert(std::make_pair(it->first, it->second));
         }
         flush(interruptor);
@@ -394,13 +505,13 @@ private:
         buf_write_t sb_write(&superblock);
         cluster_metadata_superblock_t *sb
             = static_cast<cluster_metadata_superblock_t *>(sb_write.get_data_write());
-        write_blob(buf_parent_t(&superblock), sb->*field_name,
-                   cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN, bh);
+        bring_up_to_date(buf_parent_t(&superblock), sb);
+        write_branch_history_blob<cluster_version_t::LATEST_DISK>(
+                buf_parent_t(&superblock), sb, bh);
     }
 
     cluster_persistent_file_t *parent;
-    char (cluster_metadata_superblock_t::*field_name)[cluster_metadata_superblock_t::BRANCH_HISTORY_BLOB_MAXREFLEN];
-    branch_history_t<protocol_t> bh;
+    branch_history_t bh;
 };
 
 /* These must be defined when the definition of
@@ -408,25 +519,13 @@ private:
 that `persistent_branch_history_manager_t *` can be implicitly cast to
 `branch_history_manager_t *`. */
 
-branch_history_manager_t<mock::dummy_protocol_t> *cluster_persistent_file_t::get_dummy_branch_history_manager() {
-    return dummy_branch_history_manager.get();
-}
-
-branch_history_manager_t<memcached_protocol_t> *cluster_persistent_file_t::get_memcached_branch_history_manager() {
-    return memcached_branch_history_manager.get();
-}
-
-branch_history_manager_t<rdb_protocol_t> *cluster_persistent_file_t::get_rdb_branch_history_manager() {
+branch_history_manager_t *cluster_persistent_file_t::get_rdb_branch_history_manager() {
     return rdb_branch_history_manager.get();
 }
 
 void cluster_persistent_file_t::construct_branch_history_managers(bool create) {
-    dummy_branch_history_manager.init(new persistent_branch_history_manager_t<mock::dummy_protocol_t>(
-        this, &cluster_metadata_superblock_t::dummy_branch_history_blob, create));
-    memcached_branch_history_manager.init(new persistent_branch_history_manager_t<memcached_protocol_t>(
-        this, &cluster_metadata_superblock_t::memcached_branch_history_blob, create));
-    rdb_branch_history_manager.init(new persistent_branch_history_manager_t<rdb_protocol_t>(
-        this, &cluster_metadata_superblock_t::rdb_branch_history_blob, create));
+    rdb_branch_history_manager.init(new persistent_branch_history_manager_t(
+        this, create));
 }
 
 template <class metadata_t>

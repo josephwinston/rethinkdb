@@ -70,7 +70,7 @@ public:
     reql_func_t(const protob_t<const Backtrace> backtrace,  // for pb_rcheckable_t
                 const var_scope_t &captured_scope,
                 std::vector<sym_t> arg_names,
-                counted_t<term_t> body);
+                counted_t<const term_t> body);
     ~reql_func_t();
 
     counted_t<val_t> call(
@@ -84,7 +84,7 @@ public:
     void visit(func_visitor_t *visitor) const;
 
 private:
-    friend class wire_func_serialization_visitor_t;
+    template <cluster_version_t> friend class wire_func_serialization_visitor_t;
     bool filter_helper(env_t *env, counted_t<const datum_t> arg) const;
 
     // Only contains the parts of the scope that `body` uses.
@@ -94,7 +94,7 @@ private:
     std::vector<sym_t> arg_names;
 
     // The body of the function, which gets ->eval(...) called when call(...) is called.
-    counted_t<term_t> body;
+    counted_t<const term_t> body;
 
     DISABLE_COPYING(reql_func_t);
 };
@@ -119,7 +119,7 @@ public:
     void visit(func_visitor_t *visitor) const;
 
 private:
-    friend class wire_func_serialization_visitor_t;
+    template <cluster_version_t> friend class wire_func_serialization_visitor_t;
     bool filter_helper(env_t *env, counted_t<const datum_t> arg) const;
 
     std::string js_source;
@@ -153,6 +153,8 @@ counted_t<func_t> new_get_field_func(counted_t<const datum_t> obj,
 counted_t<func_t> new_eq_comparison_func(counted_t<const datum_t> obj,
                                          const protob_t<const Backtrace> &bt_src);
 
+counted_t<func_t> new_page_func(counted_t<const datum_t> method,
+                                const protob_t<const Backtrace> &bt_src);
 
 class js_result_visitor_t : public boost::static_visitor<counted_t<val_t> > {
 public:
@@ -182,16 +184,16 @@ public:
 
     // eval(scope_env_t *env) is a dumb wrapper for this.  Evaluates the func_t without
     // going by way of val_t, and without requiring a full-blown env.
-    counted_t<func_t> eval_to_func(const var_scope_t &env_scope);
+    counted_t<func_t> eval_to_func(const var_scope_t &env_scope) const;
 
 private:
     virtual void accumulate_captures(var_captures_t *captures) const;
     virtual bool is_deterministic() const;
-    virtual counted_t<val_t> term_eval(scope_env_t *env, eval_flags_t flags);
+    virtual counted_t<val_t> term_eval(scope_env_t *env, eval_flags_t flags) const;
     virtual const char *name() const { return "func"; }
 
     std::vector<sym_t> arg_names;
-    counted_t<term_t> body;
+    counted_t<const term_t> body;
 
     var_captures_t external_captures;
 };

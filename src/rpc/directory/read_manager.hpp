@@ -1,9 +1,10 @@
-// Copyright 2010-2012 RethinkDB, all rights reserved.
+// Copyright 2010-2014 RethinkDB, all rights reserved.
 #ifndef RPC_DIRECTORY_READ_MANAGER_HPP_
 #define RPC_DIRECTORY_READ_MANAGER_HPP_
 
+#include <map>
+
 #include "errors.hpp"
-#include <boost/ptr_container/ptr_map.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include "concurrency/auto_drainer.hpp"
@@ -49,7 +50,7 @@ private:
 
     /* These will be called in a blocking fashion by the connectivity service
     (or message service, in the case of `on_message()`) */
-    void on_message(peer_id_t, read_stream_t *) THROWS_ONLY(fake_archive_exc_t);
+    void on_message(peer_id_t, cluster_version_t, read_stream_t *) THROWS_ONLY(fake_archive_exc_t);
     void on_connect(peer_id_t peer) THROWS_NOTHING;
     void on_disconnect(peer_id_t peer) THROWS_NOTHING;
 
@@ -67,7 +68,7 @@ private:
     watchable_variable_t<change_tracking_map_t<peer_id_t, metadata_t> > variable;
     mutex_assertion_t variable_lock;
 
-    boost::ptr_map<peer_id_t, session_t> sessions;
+    std::map<peer_id_t, scoped_ptr_t<session_t> > sessions;
 
     /* Instances of `propagate_initialization()` and `propagate_update()` hold
     a lock on one of these drainers. */

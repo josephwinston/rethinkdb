@@ -2,21 +2,21 @@
 #include "btree/erase_range.hpp"
 
 #include "buffer_cache/alt/alt.hpp"
-#include "btree/btree_store.hpp"
 #include "btree/leaf_node.hpp"
 #include "btree/node.hpp"
+#include "btree/operations.hpp"
 #include "btree/parallel_traversal.hpp"
 #include "btree/slice.hpp"
+#include "btree/types.hpp"
 #include "concurrency/fifo_checker.hpp"
-
-void noop_value_deleter_t::delete_value(buf_parent_t, const void *) const { }
 
 class erase_range_helper_t : public btree_traversal_helper_t {
 public:
-    erase_range_helper_t(value_sizer_t<void> *sizer, key_tester_t *tester,
+    erase_range_helper_t(value_sizer_t *sizer, key_tester_t *tester,
             const value_deleter_t *deleter, const btree_key_t *left_exclusive_or_null,
             const btree_key_t *right_inclusive_or_null,
-            const std::function<void(const store_key_t &, const char *, const buf_parent_t &)>
+            const std::function<void(const store_key_t &, const char *,
+                                     const buf_parent_t &)>
                 &on_erase_cb)
         : sizer_(sizer), tester_(tester), deleter_(deleter),
           left_exclusive_or_null_(left_exclusive_or_null),
@@ -51,22 +51,24 @@ public:
 
         scoped_malloc_t<char> value(sizer_->max_possible_size());
 
+        int population_change = 0;
+
         for (size_t i = 0; i < keys_to_delete.size(); ++i) {
             bool found = leaf::lookup(sizer_, node, keys_to_delete[i].btree_key(),
                                       value.get());
             guarantee(found);
 
             if (on_erase_cb_) {
-                on_erase_cb_(keys_to_delete[i], value.get(),
-                             buf_parent_t(leaf_node_buf));
+                on_erase_cb_(keys_to_delete[i], value.get(), buf_parent_t(leaf_node_buf));
             }
 
             deleter_->delete_value(buf_parent_t(leaf_node_buf), value.get());
             leaf::erase_presence(sizer_, node, keys_to_delete[i].btree_key(),
                                  key_modification_proof_t::real_proof());
+            --population_change;
         }
 
-        *population_change_out = -static_cast<int>(keys_to_delete.size());
+        *population_change_out = population_change;
     }
 
     void postprocess_internal_node(UNUSED buf_lock_t *internal_node_buf) {
@@ -116,7 +118,7 @@ public:
     }
 
 private:
-    value_sizer_t<void> *sizer_;
+    value_sizer_t *sizer_;
     key_tester_t *tester_;
     const value_deleter_t *deleter_;
     const btree_key_t *left_exclusive_or_null_;
@@ -127,11 +129,12 @@ private:
     DISABLE_COPYING(erase_range_helper_t);
 };
 
-void btree_erase_range_generic(value_sizer_t<void> *sizer,
+void btree_erase_range_generic(value_sizer_t *sizer,
         key_tester_t *tester, const value_deleter_t *deleter,
         const btree_key_t *left_exclusive_or_null,
         const btree_key_t *right_inclusive_or_null,
-        superblock_t *superblock, signal_t *interruptor, bool release_superblock,
+        superblock_t *superblock, signal_t *interruptor,
+        release_superblock_t release_superblock,
         const std::function<void(const store_key_t &, const char *, const buf_parent_t &)>
             &on_erase_cb) {
     erase_range_helper_t helper(sizer, tester, deleter,
@@ -139,22 +142,4 @@ void btree_erase_range_generic(value_sizer_t<void> *sizer,
                                 on_erase_cb);
     btree_parallel_traversal(superblock, &helper, interruptor,
                              release_superblock);
-}
-
-// KSI: Wait, seriously?  Is it actually correct and proper for our
-// partially-completed btree erasure operation to be interrupted?  If the tree is
-// already detached, the worst that would happen is that we leak blocks, yes.
-void erase_all(value_sizer_t<void> *sizer,
-               const value_deleter_t *deleter,
-               superblock_t *superblock,
-               signal_t *interruptor,
-               bool release_superblock) {
-    struct always_true_tester_t : public key_tester_t {
-        bool key_should_be_erased(const btree_key_t *) { return true; }
-    } always_true_tester;
-
-    btree_erase_range_generic(sizer, &always_true_tester,
-                              deleter, NULL, NULL,
-                              superblock,
-                              interruptor, release_superblock);
 }

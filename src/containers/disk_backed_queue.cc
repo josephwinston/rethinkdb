@@ -4,7 +4,8 @@
 #include "arch/io/disk.hpp"
 #include "buffer_cache/alt/alt.hpp"
 #include "buffer_cache/alt/blob.hpp"
-#include "buffer_cache/alt/alt_serialize_onto_blob.hpp"
+#include "buffer_cache/alt/cache_balancer.hpp"
+#include "buffer_cache/alt/serialize_onto_blob.hpp"
 #include "serializer/config.hpp"
 
 
@@ -31,10 +32,8 @@ internal_disk_backed_queue_t::internal_disk_backed_queue_t(io_backender_t *io_ba
        crashes. */
     file_opener.unlink_serializer_file();
 
-    alt_cache_config_t cache_dynamic_config;
-    cache_dynamic_config.page_config.memory_limit = MEGABYTE;
-    cache.init(new cache_t(serializer.get(), cache_dynamic_config,
-                           &perfmon_collection));
+    balancer.init(new dummy_cache_balancer_t(2 * MEGABYTE));
+    cache.init(new cache_t(serializer.get(), balancer.get(), &perfmon_collection));
     cache_conn.init(new cache_conn_t(cache.get()));
     // Emulate cache_t::create behavior by zeroing the block with id SUPERBLOCK_ID.
     txn_t txn(cache_conn.get(), write_durability_t::HARD,
@@ -55,11 +54,27 @@ void internal_disk_backed_queue_t::push(const write_message_t &wm) {
     txn_t txn(cache_conn.get(), write_durability_t::SOFT,
               repli_timestamp_t::distant_past, 2);
 
+    push_single(&txn, wm);
+}
+
+void internal_disk_backed_queue_t::push(const scoped_array_t<write_message_t> &wms) {
+    mutex_t::acq_t mutex_acq(&mutex);
+
+    // There's no need for hard durability with an unlinked dbq file.
+    txn_t txn(cache_conn.get(), write_durability_t::SOFT,
+              repli_timestamp_t::distant_past, 2);
+
+    for (size_t i = 0; i < wms.size(); ++i) {
+        push_single(&txn, wms[i]);
+    }
+}
+
+void internal_disk_backed_queue_t::push_single(txn_t *txn, const write_message_t &wm) {
     if (head_block_id == NULL_BLOCK_ID) {
-        add_block_to_head(&txn);
+        add_block_to_head(txn);
     }
 
-    auto _head = make_scoped<buf_lock_t>(buf_parent_t(&txn), head_block_id,
+    auto _head = make_scoped<buf_lock_t>(buf_parent_t(txn), head_block_id,
                                          access_t::write);
     auto write = make_scoped<buf_write_t>(_head.get());
     queue_block_t *head = static_cast<queue_block_t *>(write->get_data_write());
@@ -76,8 +91,8 @@ void internal_disk_backed_queue_t::push(const write_message_t &wm) {
         head = NULL;
         write.reset();
         _head.reset();
-        add_block_to_head(&txn);
-        _head.init(new buf_lock_t(buf_parent_t(&txn), head_block_id,
+        add_block_to_head(txn);
+        _head.init(new buf_lock_t(buf_parent_t(txn), head_block_id,
                                   access_t::write));
         write.init(new buf_write_t(_head.get()));
         head = static_cast<queue_block_t *>(write->get_data_write());

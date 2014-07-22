@@ -3,9 +3,6 @@
 
 #include <algorithm>
 
-#include "errors.hpp"
-#include <boost/bind.hpp>
-
 #include "arch/runtime/coroutines.hpp"
 #include "btree/node.hpp"
 #include "btree/internal_node.hpp"
@@ -13,7 +10,6 @@
 #include "btree/parallel_traversal.hpp"
 #include "btree/secondary_operations.hpp"
 #include "buffer_cache/alt/alt.hpp"
-#include "protocol_api.hpp"
 
 struct backfill_traversal_helper_t : public btree_traversal_helper_t, public home_thread_mixin_debug_only_t {
     void process_a_leaf(buf_lock_t *leaf_node_buf,
@@ -148,15 +144,15 @@ struct backfill_traversal_helper_t : public btree_traversal_helper_t, public hom
 
     agnostic_backfill_callback_t *callback_;
     repli_timestamp_t since_when_;
-    value_sizer_t<void> *sizer_;
+    value_sizer_t *sizer_;
     const key_range_t& key_range_;
 
     backfill_traversal_helper_t(agnostic_backfill_callback_t *callback, repli_timestamp_t since_when,
-                                value_sizer_t<void> *sizer, const key_range_t& key_range)
+                                value_sizer_t *sizer, const key_range_t& key_range)
         : callback_(callback), since_when_(since_when), sizer_(sizer), key_range_(key_range) { }
 };
 
-void do_agnostic_btree_backfill(value_sizer_t<void> *sizer,
+void do_agnostic_btree_backfill(value_sizer_t *sizer,
                                 const key_range_t &key_range,
                                 repli_timestamp_t since_when,
                                 agnostic_backfill_callback_t *callback,
@@ -167,9 +163,17 @@ void do_agnostic_btree_backfill(value_sizer_t<void> *sizer,
         THROWS_ONLY(interrupted_exc_t) {
     rassert(coro_t::self());
 
-    std::map<std::string, secondary_index_t> sindexes;
+    std::map<sindex_name_t, secondary_index_t> sindexes;
     get_secondary_indexes(sindex_block, &sindexes);
-    callback->on_sindexes(sindexes, interruptor);
+    std::map<std::string, secondary_index_t> live_sindexes;
+    for (auto it = sindexes.begin(); it != sindexes.end(); ++it) {
+        if (!it->second.being_deleted) {
+            guarantee(!it->first.being_deleted);
+            auto res = live_sindexes.insert(std::make_pair(it->first.name, it->second));
+            guarantee(res.second);
+        }
+    }
+    callback->on_sindexes(live_sindexes, interruptor);
 
     backfill_traversal_helper_t helper(callback, since_when, sizer, key_range);
     helper.progress = p;

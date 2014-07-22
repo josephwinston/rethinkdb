@@ -10,7 +10,6 @@
 
 #include "buffer_cache/alt/block_version.hpp"
 #include "buffer_cache/alt/cache_account.hpp"
-#include "buffer_cache/alt/config.hpp"
 #include "buffer_cache/alt/evicter.hpp"
 #include "buffer_cache/alt/free_list.hpp"
 #include "buffer_cache/alt/page.hpp"
@@ -26,7 +25,8 @@
 #include "repli_timestamp.hpp"
 #include "serializer/types.hpp"
 
-class alt_memory_tracker_t;
+class alt_txn_throttler_t;
+class cache_balancer_t;
 class auto_drainer_t;
 class cache_t;
 class file_account_t;
@@ -72,20 +72,25 @@ namespace alt {
 
 // Has information necessary for the current_page_t to do certain things -- it's
 // known by the current_page_acq_t.
-struct current_page_help_t;
+class current_page_help_t;
 
 class current_page_t {
 public:
-    // Constructs a fresh, empty page.
-    current_page_t(block_size_t block_size, scoped_malloc_t<ser_buffer_t> buf,
-                   page_cache_t *page_cache);
-    current_page_t(scoped_malloc_t<ser_buffer_t> buf,
+    current_page_t(block_id_t block_id, buf_ptr_t buf, page_cache_t *page_cache);
+    current_page_t(block_id_t block_id, buf_ptr_t buf,
                    const counted_t<standard_block_token_t> &token,
                    page_cache_t *page_cache);
     // Constructs a page to be loaded from the serializer.
-    current_page_t();
+    explicit current_page_t(block_id_t block_id);
+
+    // You MUST call reset() before destructing a current_page_t!
     ~current_page_t();
 
+    // You can only call this when it's safe to do so!  (Beware of
+    // current_page_acq_t's, last write acquirer page_txn_t's, and read-ahead logic.)
+    void reset(page_cache_t *page_cache);
+
+    bool should_be_evicted() const;
 
 private:
     // current_page_acq_t should not access our fields directly.
@@ -93,6 +98,8 @@ private:
     void add_acquirer(current_page_acq_t *acq);
     void remove_acquirer(current_page_acq_t *acq);
     void pulse_pulsables(current_page_acq_t *acq);
+    void add_keepalive();
+    void remove_keepalive();
 
     page_t *the_page_for_write(current_page_help_t help, cache_account_t *account);
     page_t *the_page_for_read(current_page_help_t help, cache_account_t *account);
@@ -116,11 +123,14 @@ private:
     // Has access to our fields.
     friend class page_cache_t;
 
+    friend backindex_bag_index_t *access_backindex(current_page_t *current_page);
+
     bool is_deleted() const { return is_deleted_; }
 
-    void make_non_deleted(block_size_t block_size,
-                          scoped_malloc_t<ser_buffer_t> buf,
-                          page_cache_t *page_cache);
+    // KSI: We could get rid of this variable if
+    // page_txn_t::pages_write_acquired_last_ noted each page's block_id_t.  Other
+    // space reductions are more important.
+    block_id_t block_id_;
 
     // page_ can be null if we haven't tried loading the page yet.  We don't want to
     // prematurely bother loading the page if it's going to be deleted.
@@ -133,6 +143,8 @@ private:
 
     // The last write acquirer for this page.
     page_txn_t *last_write_acquirer_;
+    // Our index into the last_write_acquirer_->pages_write_acquired_last_.
+    backindex_bag_index_t last_write_acquirer_index_;
 
     // The version of the page, that the last write acquirer had.
     block_version_t last_write_acquirer_version_;
@@ -142,8 +154,17 @@ private:
     // All list elements have current_page_ != NULL, snapshotted_page_ == NULL.
     intrusive_list_t<current_page_acq_t> acquirers_;
 
+    // Avoids eviction if > 0. This is used by snapshotted current_page_acq_t's
+    // that have a snapshotted version of this block. If the current_page_t
+    // would be evicted that would mess with the block version.
+    intptr_t num_keepalives_;
+
     DISABLE_COPYING(current_page_t);
 };
+
+inline backindex_bag_index_t *access_backindex(current_page_t *current_page) {
+    return &current_page->last_write_acquirer_index_;
+}
 
 class current_page_acq_t : public intrusive_list_node_t<current_page_acq_t>,
                            public home_thread_mixin_debug_only_t {
@@ -244,11 +265,10 @@ class page_read_ahead_cb_t : public home_thread_mixin_t,
                              public serializer_read_ahead_callback_t {
 public:
     page_read_ahead_cb_t(serializer_t *serializer,
-                         page_cache_t *cache,
-                         uint64_t bytes_to_send);
+                         page_cache_t *cache);
 
     void offer_read_ahead_buf(block_id_t block_id,
-                              scoped_malloc_t<ser_buffer_t> *buf,
+                              buf_ptr_t *buf,
                               const counted_t<standard_block_token_t> &token);
 
     void destroy_self();
@@ -259,17 +279,14 @@ private:
     serializer_t *serializer_;
     page_cache_t *page_cache_;
 
-    // How many more bytes of data can we send?
-    uint64_t bytes_remaining_;
-
     DISABLE_COPYING(page_read_ahead_cb_t);
 };
 
-class tracker_acq_t {
+class throttler_acq_t {
 public:
-    tracker_acq_t() { }
-    ~tracker_acq_t() { }
-    tracker_acq_t(tracker_acq_t &&movee)
+    throttler_acq_t() { }
+    ~throttler_acq_t() { }
+    throttler_acq_t(throttler_acq_t &&movee)
         : semaphore_acq_(std::move(movee.semaphore_acq_)) {
         movee.semaphore_acq_.reset();
     }
@@ -278,28 +295,30 @@ public:
     void update_dirty_page_count(int64_t new_count);
 
 private:
-    friend class ::alt_memory_tracker_t;
+    friend class ::alt_txn_throttler_t;
     // At first, the number of dirty pages is 0 and semaphore_acq_.count() >=
     // dirtied_count_.  Once the number of dirty pages gets bigger than the original
     // value of semaphore_acq_.count(), we use semaphore_acq_.change_count() to keep
     // the numbers equal.
     new_semaphore_acq_t semaphore_acq_;
 
-    DISABLE_COPYING(tracker_acq_t);
+    DISABLE_COPYING(throttler_acq_t);
 };
+
+class page_cache_index_write_sink_t;
 
 class page_cache_t : public home_thread_mixin_t {
 public:
     page_cache_t(serializer_t *serializer,
-                 const page_cache_config_t &config,
-                 memory_tracker_t *tracker);
+                 cache_balancer_t *balancer,
+                 alt_txn_throttler_t *throttler);
     ~page_cache_t();
 
     // Takes a txn to be flushed.  Calls on_flush_complete() (which resets the
-    // tracker_acq parameter) when done.
+    // throttler_acq parameter) when done.
     void flush_and_destroy_txn(
             scoped_ptr_t<page_txn_t> txn,
-            std::function<void(tracker_acq_t *)> on_flush_complete);
+            std::function<void(throttler_acq_t *)> on_flush_complete);
 
     current_page_t *page_for_block_id(block_id_t block_id);
     current_page_t *page_for_new_block_id(block_id_t *block_id_out);
@@ -310,7 +329,7 @@ public:
     size_t total_page_memory() const;
     size_t evictable_page_memory() const;
 
-    block_size_t max_block_size() const { return max_block_size_; }
+    max_block_size_t max_block_size() const { return max_block_size_; }
 
     cache_account_t create_cache_account(int priority);
 
@@ -318,21 +337,31 @@ public:
         return &default_reads_account_;
     }
 
+    // Considers wiping out the current_page_t (and its page_t pointee) for a
+    // particular block id, to save memory, if the right conditions are met.  (This
+    // should only be called by things "outside" of current_page_t, like
+    // current_page_acq_t and page_txn_t, not page_t and page_ptr_t -- that way we
+    // know it's not called while somebody up the stack is expecting their
+    // `current_page_t *` to remain valid.)
+    void consider_evicting_current_page(block_id_t block_id);
+
+    void have_read_ahead_cb_destroyed();
+
+    evicter_t &evicter() { return evicter_; }
+
+    auto_drainer_t::lock_t drainer_lock() { return drainer_->lock(); }
+    serializer_t *serializer() { return serializer_; }
+
 private:
     friend class page_read_ahead_cb_t;
     void add_read_ahead_buf(block_id_t block_id,
                             ser_buffer_t *buf,
                             const counted_t<standard_block_token_t> &token);
 
-    void have_read_ahead_cb_destroyed();
-
     void read_ahead_cb_is_destroyed();
 
 
     current_page_t *internal_page_for_new_chosen(block_id_t block_id);
-
-    friend class page_t;
-    evicter_t &evicter() { return evicter_; }
 
     // KSI: Maybe just have txn_t hold a single list of block_change_t objects.
     struct block_change_t {
@@ -357,21 +386,17 @@ private:
                                  fifo_enforcer_write_token_t index_write_token);
     static void do_flush_txn_set(page_cache_t *page_cache,
                                  std::map<block_id_t, block_change_t> *changes_ptr,
-                                 const std::set<page_txn_t *> &txns);
+                                 const std::vector<page_txn_t *> &txns);
 
-    // Returns the set of page_txn_t's that have been unblocked.  The caller must
-    // call im_waiting_for_flush on them (or somehow replicate its behavior).
-    static MUST_USE std::set<page_txn_t *>
-    remove_txn_set_from_graph(page_cache_t *page_cache,
-                              const std::set<page_txn_t *> &txns);
+    static void remove_txn_set_from_graph(page_cache_t *page_cache,
+                                          const std::vector<page_txn_t *> &txns);
 
     static std::map<block_id_t, block_change_t>
-    compute_changes(const std::set<page_txn_t *> &txns);
+    compute_changes(const std::vector<page_txn_t *> &txns);
 
-    bool exists_flushable_txn_set(page_txn_t *txn,
-                                  std::set<page_txn_t *> *flush_set_out);
+    static std::vector<page_txn_t *> maximal_flushable_txn_set(page_txn_t *base);
 
-    void im_waiting_for_flush(std::set<page_txn_t *> txns);
+    void im_waiting_for_flush(page_txn_t *txns);
 
     friend class current_page_acq_t;
     repli_timestamp_t recency_for_block_id(block_id_t id) {
@@ -388,13 +413,14 @@ private:
     }
 
     friend class current_page_t;
-    serializer_t *serializer() { return serializer_; }
     free_list_t *free_list() { return &free_list_; }
 
     void resize_current_pages_to_id(block_id_t block_id);
 
-    const page_cache_config_t dynamic_config_;
-    const block_size_t max_block_size_;
+    static void consider_evicting_all_current_pages(page_cache_t *page_cache,
+                                                    auto_drainer_t::lock_t lock);
+
+    const max_block_size_t max_block_size_;
 
     // We use separate I/O accounts for reads and writes, so reads can pass ahead of
     // flushes.  The rationale behind this is that reads are almost always blocking
@@ -413,13 +439,12 @@ private:
     // move to the serializer thread and get a bunch of blocks written.
     // index_write_sink's pointee's home thread is on the serializer.
     fifo_enforcer_source_t index_write_source_;
-    scoped_ptr_t<fifo_enforcer_sink_t> index_write_sink_;
+    scoped_ptr_t<page_cache_index_write_sink_t> index_write_sink_;
 
     serializer_t *serializer_;
     segmented_vector_t<repli_timestamp_t> recencies_;
 
-    // RSP: Array growth slow.
-    std::vector<current_page_t *> current_pages_;
+    segmented_vector_t<current_page_t *> current_pages_;
 
     free_list_t free_list_;
 
@@ -514,7 +539,7 @@ public:
     page_txn_t(page_cache_t *page_cache,
                // Unused for read transactions, pass repli_timestamp_t::invalid.
                repli_timestamp_t txn_recency,
-               tracker_acq_t tracker_acq,
+               throttler_acq_t throttler_acq,
                cache_conn_t *cache_conn);
 
     // KSI: This is only to be called by the page cache -- should txn_t really use a
@@ -527,7 +552,7 @@ private:
     // To set cache_conn_ to NULL.
     friend class ::cache_conn_t;
 
-    // To access tracker_acq_.
+    // To access throttler_acq_.
     friend class flush_and_destroy_txn_waiter_t;
 
     // page cache has access to all of this type's innards, including fields.
@@ -557,7 +582,7 @@ private:
     cache_conn_t *cache_conn_;
 
     // An acquisition object for the memory tracker.
-    tracker_acq_t tracker_acq_;
+    throttler_acq_t throttler_acq_;
 
     repli_timestamp_t this_txn_recency_;
 
@@ -568,27 +593,38 @@ private:
     // at this page_txn_t.  (And vice versa for each page_txn_t pointed at by
     // preceders_.)
 
+    // PERFORMANCE(preceders_): PERFORMANCE(subseqers_):
+    //
+    // Performance on operations linear in the number of preceders_ and subseqers_
+    // should be _okay_ in any case, because we throttle transactions based on the
+    // number of dirty blocks.  But also, the number of preceders_ and subseqers_
+    // would generally be very low, because relationships for users of the same block
+    // or cache connection form a chain, not a giant clique.
+
     // The transactions that must be committed before or at the same time as this
     // transaction.
     std::vector<page_txn_t *> preceders_;
 
-    // txn's that we precede.
-    // RSP: Performance?
+    // txn's that we precede -- preceders_[i]->subseqers_ always contains us once.
     std::vector<page_txn_t *> subseqers_;
 
-    // Pages for which this page_txn_t is the last_write_acquirer_ of that page.
-    std::vector<current_page_t *> pages_write_acquired_last_;
+    // Pages for which this page_txn_t is the last_write_acquirer_ of that page.  We
+    // wouldn't mind a std::vector inside the backindex_bag_t, but it's a
+    // segmented_vector_t -- we give it a segment size big enough to not be obnoxious
+    // about memory usage.
+    backindex_bag_t<current_page_t *, 16> pages_write_acquired_last_;
 
-    // acqs that are currently alive.
-    // RSP: Performance?  remove_acquirer takes linear time.
-    std::vector<current_page_acq_t *> live_acqs_;
+    // How many current_page_acq_t's for this transaction that are currently alive.
+    size_t live_acqs_;
 
     // Saved pages (by block id).
-    // RSP: Right now we put multiple dirtied_page_t's if we reacquire the same block and modify it again.
+    // KSI: Right now we put multiple dirtied_page_t's if we reacquire the same block
+    // and modify it again.
     segmented_vector_t<dirtied_page_t, 8> snapshotted_dirtied_pages_;
 
     // Touched pages (by block id).
-    // RSP: Right now we put multiple touched_page_t's if we reacquire the same block and modify it again.
+    // KSI: Right now we put multiple touched_page_t's if we reacquire the same block
+    // and modify it again.
     segmented_vector_t<touched_page_t, 8> touched_pages_;
 
     // KSI: We could probably turn began_waiting_for_flush_ and spawned_flush_ into a
@@ -601,6 +637,16 @@ private:
     // waiting for a flush.
     bool began_waiting_for_flush_;
     bool spawned_flush_;
+
+    enum mark_state_t {
+        marked_not,
+        marked_red,
+        marked_blue,
+        marked_green,
+    };
+    // Always `marked_not`, except temporarily, during ASSERT_NO_CORO_WAITING graph
+    // algorithms.
+    mark_state_t mark_;
 
     // This gets pulsed when the flush is complete or when the txn has no reason to
     // exist any more.

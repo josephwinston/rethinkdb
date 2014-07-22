@@ -116,19 +116,41 @@ describe('Javascript connection API', function(){
         var cluster_port;
 
         beforeEach(function(done){
-            port = Math.floor(Math.random()*(65535 - 1025)+1025);
-            cluster_port = port + 1;
-            server_out_log = fs.openSync('run/server-log.txt', 'a');
-            server_err_log = fs.openSync('run/server-error-log.txt', 'a');
-            cpp_server = spawn(
-                build_dir + '/rethinkdb',
-                ['--driver-port', port, '--http-port', '0', '--cluster-port', cluster_port],
-                {stdio: ['ignore', server_out_log, server_err_log]});
-            setTimeout(done, 1000);
+            function setup() {
+                port = Math.floor(Math.random()*(65535 - 1025)+1025);
+                cluster_port = port + 1;
+                server_out_log = fs.openSync('run/server-log.txt', 'a');
+                server_err_log = fs.openSync('run/server-error-log.txt', 'a');
+                cpp_server = spawn(
+                    build_dir + '/rethinkdb',
+                    ['--driver-port', port, '--http-port', '0', '--cluster-port', cluster_port],
+                    {stdio: ['ignore', 'pipe', 'pipe']});
+
+                cpp_server.stderr.on('data', function(data) {
+                    fs.write(server_err_log, data)
+                    // Somehow, rethinkdb dump things in stderr
+                    if (data.toString().match(/Server ready/)) {
+                        cpp_server.removeAllListeners();
+                        setTimeout(done, 500); // We give the server 500ms to avoid errors like ("Cannot compute blueprint...")
+                    }
+
+                    if (data.toString().match(/Could not bind to/)) {
+                        // The port is somehow used by someone else, let's spin up another server
+                        cpp_server.removeAllListeners();
+                        setup();
+                    }
+                });
+                cpp_server.stdout.on('data', function(data) {
+                    fs.write(server_out_log, data)
+                });
+            }
+
+            setup();
         });
 
         afterEach(function(done){
             cpp_server.kill();
+            cpp_server.removeAllListeners();
             spawn('rm', ['-rf', 'rethinkdb_data']);
             setTimeout(done, 10);
             fs.close(server_out_log);
@@ -136,20 +158,20 @@ describe('Javascript connection API', function(){
         });
 
         it("authorization key when none needed", function(done){
-            r.connect({port: port, authKey: "hunter2"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: incorrect authorization key\"", done));
+            r.connect({port: port, authKey: "hunter2"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"", done));
         });
 
         it("correct authorization key", function(done){
             spawn(build_dir + '/rethinkdb',
                   ['admin', '--join', 'localhost:' + cluster_port, 'set', 'auth', 'hunter2'],
                   {stdio: ['ignore', server_out_log, server_err_log]});
-
             setTimeout(function(){
                 r.connect({port: port, authKey: "hunter2"}, function(e, c){
                     assertNull(e);
                     r.expr(1).run(c, noError(done));
                 });
             }, 500);
+
         });
 
         it("wrong authorization key", function(done){
@@ -158,7 +180,7 @@ describe('Javascript connection API', function(){
                   {stdio: ['ignore', server_out_log, server_err_log]});
 
             setTimeout(function(){
-                r.connect({port: port, authKey: "hunter23"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: incorrect authorization key\"", done));
+                r.connect({port: port, authKey: "hunter23"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: Incorrect authorization key.\"", done));
             }, 500);
         });
 
@@ -238,9 +260,15 @@ describe('Javascript connection API', function(){
         }));
 
         it("close waits even without callback", withConnection(function(done, c){
-            r.js('while(true);', {timeout: 0.5}).run(c, {noreply: true});
-            c.close();
-            r(1).run(c, noError(done));
+            var start = Date.now();
+            var timeout = 1.5;
+            r.js('while(true);', {timeout: timeout}).run(c, {noreply: true});
+            c.close(function(err) {
+                if (err) throw err;
+                var duration = Date.now()-start;
+                assert(duration > timeout*1000);
+                done()
+            });
         }));
 
         it("test use", withConnection(function(done, c){
@@ -250,7 +278,7 @@ describe('Javascript connection API', function(){
                         c.use('db2');
                         r.table('t2').run(c, noError(function(){
                             c.use('test');
-                            r.table('t2').run(c, givesError("RqlRuntimeError", "Table `t2` does not exist.",
+                            r.table('t2').run(c, givesError("RqlRuntimeError", "Table `test.t2` does not exist",
                                                             done));
                         }));}));}));}));}));
 
@@ -261,35 +289,35 @@ describe('Javascript connection API', function(){
         }));
 
         it("test default durability", withConnection(function(done, c){
-            r.db('test').tableCreate('t1').run(c, function(){
+            r.db('test').tableCreate('t1').run(c, noError(function(){
                 r.db('test').table('t1').insert({data:"5"}).run(c, {durability: "default"},
-                    givesError("RqlRuntimeError", "Durability option `default` unrecognized (options are \"hard\" and \"soft\").", done));
-            });
+                    givesError("RqlRuntimeError", "Durability option `default` unrecognized (options are \"hard\" and \"soft\")", done));
+            }));
         }));
 
         it("test wrong durability", withConnection(function(done, c){
-            r.db('test').tableCreate('t1').run(c, function(){
+            r.db('test').tableCreate('t1').run(c, noError(function(){
                 r.db('test').table('t1').insert({data:"5"}).run(c, {durability: "wrong"},
-                    givesError("RqlRuntimeError", "Durability option `wrong` unrecognized (options are \"hard\" and \"soft\").", done))
-            });
+                    givesError("RqlRuntimeError", "Durability option `wrong` unrecognized (options are \"hard\" and \"soft\")", done))
+            }));
         }));
 
         it("test soft durability", withConnection(function(done, c){
-            r.db('test').tableCreate('t1').run(c, function(){
+            r.db('test').tableCreate('t1').run(c, noError(function(){
                 r.db('test').table('t1').insert({data:"5"}).run(c, {durability: "soft"}, noError(done));
-            });
+            }));
         }));
 
         it("test hard durability", withConnection(function(done, c){
-            r.db('test').tableCreate('t1').run(c, function(){
+            r.db('test').tableCreate('t1').run(c, noError(function(){
                 r.db('test').table('t1').insert({data:"5"}).run(c, {durability: "hard"}, noError(done));
-            });
+            }));
         }));
 
         it("test non-deterministic durability", withConnection(function(done, c){
-            r.db('test').tableCreate('t1').run(c, function(){
+            r.db('test').tableCreate('t1').run(c, noError(function(){
                 r.db('test').table('t1').insert({data:"5"}).run(c, {durability: r.js("'so' + 'ft'")}, noError(done));
-            });
+            }));
         }));
 
         it("fails to query after kill", withConnection(function(done, c){
@@ -316,7 +344,6 @@ describe('Javascript connection API', function(){
         }));
 
         it("missing arguments cause exception", withConnection(function(done,c){
-            assert.throws(function(){ r.connect(); });
             assert.throws(function(){ c.use(); });
             done();
         }));

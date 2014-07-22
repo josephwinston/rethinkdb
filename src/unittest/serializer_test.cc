@@ -1,6 +1,8 @@
 #include <functional>
 
 #include "arch/runtime/starter.hpp"
+#include "concurrency/new_mutex.hpp"
+#include "serializer/buf_ptr.hpp"
 #include "serializer/config.hpp"
 #include "unittest/mock_file.hpp"
 #include "unittest/gtest.hpp"
@@ -26,9 +28,7 @@ void run_AddDeleteRepeatedly(bool perform_index_write) {
                               &file_opener,
                               &get_global_perfmon_collection());
 
-    scoped_malloc_t<ser_buffer_t> buf
-        = serializer_t::allocate_buffer(ser.max_block_size());
-    memset(buf->cache_data, 0, ser.max_block_size().value());
+    buf_ptr_t buf = buf_ptr_t::alloc_zeroed(ser.max_block_size());
 
     scoped_ptr_t<file_account_t> account(ser.make_io_account(1));
 
@@ -38,7 +38,7 @@ void run_AddDeleteRepeatedly(bool perform_index_write) {
     for (int i = 0; i < 2000; ++i) {
         const block_id_t block_id = i;
         std::vector<buf_write_info_t> infos;
-        infos.push_back(buf_write_info_t(buf.get(), ser.max_block_size(), block_id));
+        infos.push_back(buf_write_info_t(buf.ser_buffer(), buf.block_size(), block_id));
 
         // Create the block
         struct : public iocallback_t, public cond_t {
@@ -58,14 +58,20 @@ void run_AddDeleteRepeatedly(bool perform_index_write) {
             {
                 std::vector<index_write_op_t> write_ops;
                 write_ops.push_back(index_write_op_t(block_id, tokens[0], repli_timestamp_t::distant_past));
-                ser.index_write(write_ops, account.get());
+
+                // There are no other index_write operations to maintain ordering with.
+                new_mutex_in_line_t dummy_acq;
+                ser.index_write(&dummy_acq, write_ops, account.get());
             }
             // Now delete the only block token and delete the index reference.
             tokens.clear();
             {
                 std::vector<index_write_op_t> write_ops;
                 write_ops.push_back(index_write_op_t(block_id, counted_t<standard_block_token_t>()));
-                ser.index_write(write_ops, account.get());
+
+                // There are no other index_write operations to maintain ordering with.
+                new_mutex_in_line_t dummy_acq;
+                ser.index_write(&dummy_acq, write_ops, account.get());
             }
 
         } else {

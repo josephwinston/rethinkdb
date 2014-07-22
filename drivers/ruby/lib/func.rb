@@ -1,8 +1,9 @@
 module RethinkDB
   class RQL
+    @@gensym_mutex = Mutex.new
     @@gensym_cnt = 0
     def new_func(&b)
-      args = (0...b.arity).map{@@gensym_cnt += 1}
+      args = @@gensym_mutex.synchronize{(0...b.arity).map{@@gensym_cnt += 1}}
       body = b.call(*(args.map{|i| RQL.new.var i}))
       RQL.new.func(args, body)
     end
@@ -33,7 +34,10 @@ module RethinkDB
       :orderby => -1,
       :group => -1,
       :iso8601 => -1,
-      :index_create => -1
+      :index_create => -1,
+      :random => -1,
+      :http => 1,
+      :distinct => -1
     }
     @@method_aliases = {
       :lt => :<,
@@ -53,12 +57,11 @@ module RethinkDB
       :javascript => :js,
       :typeof => :type_of
     }
-    @@allow_json = {:INSERT => true}
 
     termtypes = Term::TermType.constants.map{ |c| c.to_sym }
     termtypes.each {|termtype|
 
-      method = define_method(termtype.downcase){|*a, &b|
+      method_body = proc { |*a, &b|
         bitop = [:"|", :"&"].include?(__method__)
 
         if [:<, :<=, :>, :>=, :+, :-, :*, :/, :%].include?(__method__)
@@ -86,27 +89,25 @@ module RethinkDB
           optargs = a.delete_at(opt_offset) if a[opt_offset].class == Hash
         end
 
-        args = (@body ? [self] : []) + a + (b ? [new_func(&b)] : [])
+        args = ((@body != RQL) ? [self] : []) + a + (b ? [new_func(&b)] : [])
 
-        t = Term.new
-        t.type = Term::TermType.const_get(termtype)
-        t.args = args.map{|x| RQL.new.expr(x, :allow_json => @@allow_json[termtype]).to_pb}
-        t.optargs = (optargs || {}).map {|k,v|
-          ap = Term::AssocPair.new
-          ap.key = k.to_s
-          ap.val = RQL.new.expr(v, :allow_json => @@allow_json[termtype]).to_pb
-          ap
-        }
+        t = [Term::TermType.const_get(termtype),
+             args.map {|x| RQL.new.expr(x).to_pb},
+             *((optargs && optargs != {}) ?
+               [Hash[optargs.map {|k,v| [k.to_s, RQL.new.expr(v).to_pb]}]] :
+               [])]
         return RQL.new(t, bitop)
       }
 
+      define_method(termtype.downcase, &method_body)
+
       [*@@method_aliases[termtype.downcase]].each{|method_alias|
-        define_method method_alias, method
+        define_method method_alias, &method_body
       }
     }
 
     def connect(*args, &b)
-      unbound_if @body
+      unbound_if @body != RQL
       c = Connection.new(*args)
       b ? begin b.call(c) ensure c.close end : c
     end
@@ -131,19 +132,21 @@ module RethinkDB
       you want a query that does equality comparison.
 
       If you need to see whether two queries are the same, compare
-      their protobufs like: `query1.to_pb == query2.to_pb`."
+      the raw qeuries like: `query1.to_pb == query2.to_pb`."
     end
 
     def do(*args, &b)
-      a = (@body ? [self] : []) + args.dup
+      a = ((@body != RQL) ? [self] : []) + args.dup
       if a == [] && !b
-        raise RqlDriverError, "Expected 1 or more argument(s) but found 0."
+        raise RqlDriverError, "Expected 1 or more arguments but found 0."
       end
-      RQL.new.funcall(*((b ? [new_func(&b)] : [a.pop]) + a))
+      funcall_args = (b ? [new_func(&b)] : [a.pop]) + a
+      # PP.pp funcall_args
+      RQL.new.funcall(*funcall_args)
     end
 
     def row
-      unbound_if @body
+      unbound_if(@body != RQL)
       raise NoMethodError, ("Sorry, r.row is not available in the ruby driver.  " +
                             "Use blocks instead.")
     end

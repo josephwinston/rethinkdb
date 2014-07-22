@@ -33,25 +33,25 @@ tests:
       ot: []
 
     # Table create options
-    - py: db.table_create('ab', primary_key='bar', cache_size=123, durability='soft')
-      js: db.tableCreate('ab', {primary_key:'bar', cache_size:123, durability:'soft'})
-      rb: db.table_create('ab', {:primary_key => 'bar', :cache_size => 123, :durability => 'soft'})
+    - py: db.table_create('ab', primary_key='bar', durability='soft')
+      js: db.tableCreate('ab', {primary_key:'bar', durability:'soft'})
+      rb: db.table_create('ab', {:primary_key => 'bar', :durability => 'soft'})
       ot: ({'created':1})
 
     - cd: db.table_drop('ab')
       ot: ({'dropped':1})
 
-    - py: db.table_create('ab', primary_key='bar', cache_size=123, durability='hard')
-      js: db.tableCreate('ab', {primary_key:'bar', cache_size:123, durability:'hard'})
-      rb: db.table_create('ab', {:primary_key => 'bar', :cache_size => 123, :durability => 'hard'})
+    - py: db.table_create('ab', primary_key='bar', durability='hard')
+      js: db.tableCreate('ab', {primary_key:'bar', durability:'hard'})
+      rb: db.table_create('ab', {:primary_key => 'bar', :durability => 'hard'})
       ot: ({'created':1})
 
     - cd: db.table_drop('ab')
       ot: ({'dropped':1})
 
-    - py: db.table_create('ab', primary_key='bar', cache_size=123, durability='wrong')
-      js: db.tableCreate('ab', {primary_key:'bar', cache_size:123, durability:'wrong'})
-      rb: db.table_create('ab', {:primary_key => 'bar', :cache_size => 123, :durability => 'wrong'})
+    - py: db.table_create('ab', primary_key='bar', durability='wrong')
+      js: db.tableCreate('ab', {primary_key:'bar', durability:'wrong'})
+      rb: db.table_create('ab', {:primary_key => 'bar', :durability => 'wrong'})
       ot: err('RqlRuntimeError', 'Durability option `wrong` unrecognized (options are "hard" and "soft").', [0])
 
 
@@ -60,34 +60,26 @@ tests:
       ot: ({'created':1})
 
     - cd: db.table_create('foo')
-      ot: err('RqlRuntimeError', 'Table `foo` already exists.', [0])
+      ot: err('RqlRuntimeError', 'Table `test.foo` already exists.', [0])
 
     - cd: db.table_drop('foo')
       ot: ({'dropped':1})
 
     - cd: db.table_drop('foo')
-      ot: err('RqlRuntimeError', 'Table `foo` does not exist.', [0])
+      ot: err('RqlRuntimeError', 'Table `test.foo` does not exist.', [0])
 
     - cd: db.table_create('nonsense', 'foo')
-      py: [] # In python, 'foo' becomes the primary key
       ot:
-        cd: err('RqlDriverError', 'Expected 1 argument(s) but found 2.', [])
+        js: err('RqlDriverError', 'Expected 1 argument (not including options) but found 2.', [])
         rb: err("RqlCompileError", "Expected between 1 and 2 arguments but found 3.", [])
+        py: err("RqlCompileError", "Expected between 1 and 2 arguments but found 3.", [])
 
     - js: db.table_create('nonsense', {'foo':'bar'})
       py: db.table_create('nonsense', foo='bar')
       rb: db.table_create('nonsense', :foo => 'bar')
-      ot:
-        rb: err('RqlCompileError', "Unrecognized optional argument `foo`.", [])
-        js: err('RqlCompileError', 'Unrecognized optional argument `foo`.', [])
-        py: err('TypeError', "table_create() got an unexpected keyword argument 'foo'", [])
+      ot: err('RqlCompileError', "Unrecognized optional argument `foo`.", [])
 
     - js: db.table_create('nonsense1', {'datacenter':'bar'})
       py: db.table_create('nonsense1', datacenter='bar')
       rb: db.table_create('nonsense1', :datacenter => 'bar')
       ot: err('RqlRuntimeError', 'Datacenter `bar` does not exist.', [0])
-
-    - js: db.table_create('nonsense2', {'cacheSize':'bar'})
-      py: db.table_create('nonsense2', cache_size='bar')
-      rb: db.table_create('nonsense2', :cache_size => 'bar')
-      ot: err('RqlRuntimeError', 'Expected type NUMBER but found STRING.', [0])

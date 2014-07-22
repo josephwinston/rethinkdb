@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import sys, os, datetime, time, shutil, tempfile, subprocess
 from optparse import OptionParser
+from ._backup import *
 
 info = "'rethinkdb dump' creates an archive of data from a RethinkDB cluster"
 usage = "rethinkdb dump [-c HOST:PORT] [-a AUTH_KEY] [-f FILE] [--clients NUM] [-e (DB | DB.TABLE)]..."
@@ -38,6 +39,7 @@ def parse_options():
     parser.add_option("-e", "--export", dest="tables", metavar="(db | db.table)", default=[], action="append", type="string")
 
     parser.add_option("--clients", dest="clients", metavar="NUM", default=3, type="int")
+    parser.add_option("--debug", dest="debug", default=False, action="store_true")
     parser.add_option("-h", "--help", dest="help", default=False, action="store_true")
     (options, args) = parser.parse_args()
 
@@ -52,12 +54,7 @@ def parse_options():
     res = { }
 
     # Verify valid host:port --connect option
-    host_port = options.host.split(":")
-    if len(host_port) == 1:
-        host_port = (host_port[0], "28015") # If just a host, use the default port
-    if len(host_port) != 2:
-        raise RuntimeError("Error: Invalid 'host:port' format: %s" % options.host)
-    (res["host"], res["port"]) = host_port
+    (res["host"], res["port"]) = parse_connect_option(options.host)
 
     # Verify valid output file
     res["temp_filename"] = "rethinkdb_dump_%s" % datetime.datetime.today().strftime("%Y-%m-%dT%H:%M:%S")
@@ -76,6 +73,7 @@ def parse_options():
 
     res["tables"] = options.tables
     res["auth_key"] = options.auth_key
+    res["debug"] = options.debug
     return res
 
 def do_export(temp_dir, options):
@@ -85,8 +83,12 @@ def do_export(temp_dir, options):
     export_args.extend(["--directory", os.path.join(temp_dir, options["temp_filename"])])
     export_args.extend(["--auth", options["auth_key"]])
     export_args.extend(["--clients", str(options["clients"])])
+
     for table in options["tables"]:
         export_args.extend(["--export", table])
+
+    if options["debug"]:
+        export_args.extend(["--debug"])
 
     res = subprocess.call(export_args)
     if res != 0:

@@ -3,66 +3,67 @@
 
 #include <map>
 
-#include "clustering/administration/metadata.hpp"
 #include "rdb_protocol/batching.hpp"
 #include "rdb_protocol/env.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/term.hpp"
 #include "rdb_protocol/val.hpp"
 
+#include "debug.hpp"
+
 namespace ql {
 
 rdb_namespace_interface_t::rdb_namespace_interface_t(
-        namespace_interface_t<rdb_protocol_t> *internal, env_t *env)
-    : internal_(internal), env_(env) { }
+        namespace_interface_t *internal)
+    : internal_(internal) { }
 
 void rdb_namespace_interface_t::read(
-        const rdb_protocol_t::read_t &read,
-        rdb_protocol_t::read_response_t *response,
-        order_token_t tok,
-        signal_t *interruptor)
+        env_t *env,
+        const read_t &read,
+        read_response_t *response,
+        order_token_t tok)
     THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
-    profile::starter_t starter("Perform read.", env_->trace);
-    profile::splitter_t splitter(env_->trace);
-    r_sanity_check(read.profile == env_->profile());
+    profile::starter_t starter("Perform read.", env->trace);
+    profile::splitter_t splitter(env->trace);
+    r_sanity_check(read.profile == env->profile());
     /* Do the actual read. */
-    internal_->read(read, response, tok, interruptor);
+    internal_->read(read, response, tok, env->interruptor);
     /* Append the results of the parallel tasks to the current trace */
     splitter.give_splits(response->n_shards, response->event_log);
 }
 
 void rdb_namespace_interface_t::read_outdated(
-        const rdb_protocol_t::read_t &read,
-        rdb_protocol_t::read_response_t *response,
-        signal_t *interruptor)
+        env_t *env,
+        const read_t &read,
+        read_response_t *response)
     THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
-    profile::starter_t starter("Perform outdated read.", env_->trace);
-    profile::splitter_t splitter(env_->trace);
+    profile::starter_t starter("Perform outdated read.", env->trace);
+    profile::splitter_t splitter(env->trace);
     /* propagate whether or not we're doing profiles */
-    r_sanity_check(read.profile == env_->profile());
+    r_sanity_check(read.profile == env->profile());
     /* Do the actual read. */
-    internal_->read_outdated(read, response, interruptor);
+    internal_->read_outdated(read, response, env->interruptor);
     /* Append the results of the profile to the current task */
     splitter.give_splits(response->n_shards, response->event_log);
 }
 
 void rdb_namespace_interface_t::write(
-        rdb_protocol_t::write_t *write,
-        rdb_protocol_t::write_response_t *response,
-        order_token_t tok,
-        signal_t *interruptor)
+        env_t *env,
+        write_t *write,
+        write_response_t *response,
+        order_token_t tok)
     THROWS_ONLY(interrupted_exc_t, cannot_perform_query_exc_t) {
-    profile::starter_t starter("Perform write", env_->trace);
-    profile::splitter_t splitter(env_->trace);
+    profile::starter_t starter("Perform write", env->trace);
+    profile::splitter_t splitter(env->trace);
     /* propagate whether or not we're doing profiles */
-    write->profile = env_->profile();
+    write->profile = env->profile();
     /* Do the actual read. */
-    internal_->write(*write, response, tok, interruptor);
+    internal_->write(*write, response, tok, env->interruptor);
     /* Append the results of the profile to the current task */
     splitter.give_splits(response->n_shards, response->event_log);
 }
 
-std::set<rdb_protocol_t::region_t> rdb_namespace_interface_t::get_sharding_scheme()
+std::set<region_t> rdb_namespace_interface_t::get_sharding_scheme()
     THROWS_ONLY(cannot_perform_query_exc_t) {
     return internal_->get_sharding_scheme();
 }
@@ -71,17 +72,12 @@ signal_t *rdb_namespace_interface_t::get_initial_ready_signal() {
     return internal_->get_initial_ready_signal();
 }
 
-bool rdb_namespace_interface_t::has() {
-    return internal_;
-}
-
 rdb_namespace_access_t::rdb_namespace_access_t(uuid_u id, env_t *env)
-    : internal_(env->cluster_access.ns_repo, id, env->interruptor),
-      env_(env)
+    : internal_(env->ns_repo(), id, env->interruptor)
 { }
 
 rdb_namespace_interface_t rdb_namespace_access_t::get_namespace_if() {
-    return rdb_namespace_interface_t(internal_.get_namespace_if(), env_);
+    return rdb_namespace_interface_t(internal_.get_namespace_if());
 }
 
 template<class T>
@@ -103,7 +99,8 @@ reader_t::reader_t(
       use_outdated(_use_outdated),
       started(false), shards_exhausted(false),
       readgen(std::move(_readgen)),
-      active_range(readgen->original_keyrange()) { }
+      active_range(readgen->original_keyrange()),
+      items_index(0) { }
 
 void reader_t::add_transformation(transform_variant_t &&tv) {
     r_sanity_check(!started);
@@ -116,7 +113,7 @@ void reader_t::accumulate(env_t *env, eager_acc_t *acc, const terminal_variant_t
     batchspec_t batchspec = batchspec_t::user(batch_type_t::TERMINAL, env);
     read_t read = readgen->terminal_read(transforms, tv, batchspec);
     result_t res = do_read(env, std::move(read)).result;
-    acc->add_res(&res);
+    acc->add_res(env, &res);
 }
 
 void reader_t::accumulate_all(env_t *env, eager_acc_t *acc) {
@@ -132,17 +129,16 @@ void reader_t::accumulate_all(env_t *env, eager_acc_t *acc) {
     r_sanity_check(!resp.truncated);
     shards_exhausted = true;
 
-    acc->add_res(&resp.result);
+    acc->add_res(env, &resp.result);
 }
 
 rget_read_response_t reader_t::do_read(env_t *env, const read_t &read) {
     read_response_t res;
     try {
         if (use_outdated) {
-            ns_access.get_namespace_if().read_outdated(read, &res, env->interruptor);
+            ns_access.get_namespace_if().read_outdated(env, read, &res);
         } else {
-            ns_access.get_namespace_if().read(
-                read, &res, order_token_t::ignore, env->interruptor);
+            ns_access.get_namespace_if().read(env, read, &res, order_token_t::ignore);
         }
     } catch (const cannot_perform_query_exc_t &e) {
         rfail_datum(ql::base_exc_t::GENERIC, "cannot perform read: %s", e.what());
@@ -302,10 +298,12 @@ bool reader_t::is_finished() const {
 
 readgen_t::readgen_t(
     const std::map<std::string, wire_func_t> &_global_optargs,
+    std::string _table_name,
     const datum_range_t &_original_datum_range,
     profile_bool_t _profile,
     sorting_t _sorting)
     : global_optargs(_global_optargs),
+      table_name(std::move(_table_name)),
       original_datum_range(_original_datum_range),
       profile(_profile),
       sorting(_sorting) { }
@@ -355,16 +353,24 @@ read_t readgen_t::terminal_read(
 
 primary_readgen_t::primary_readgen_t(
     const std::map<std::string, wire_func_t> &global_optargs,
+    std::string table_name,
     datum_range_t range,
     profile_bool_t profile,
     sorting_t sorting)
-    : readgen_t(global_optargs, range, profile, sorting) { }
+    : readgen_t(global_optargs, std::move(table_name), range, profile, sorting) { }
+
 scoped_ptr_t<readgen_t> primary_readgen_t::make(
-    env_t *env, datum_range_t range, sorting_t sorting) {
+    env_t *env,
+    std::string table_name,
+    datum_range_t range,
+    sorting_t sorting) {
     return scoped_ptr_t<readgen_t>(
         new primary_readgen_t(
             env->global_optargs.get_all_optargs(),
-            range, env->profile(), sorting));
+            std::move(table_name),
+            range,
+            env->profile(),
+            sorting));
 }
 
 rget_read_t primary_readgen_t::next_read_impl(
@@ -374,6 +380,7 @@ rget_read_t primary_readgen_t::next_read_impl(
     return rget_read_t(
         region_t(active_range),
         global_optargs,
+        table_name,
         batchspec,
         transforms,
         boost::optional<terminal_variant_t>(),
@@ -403,18 +410,28 @@ std::string primary_readgen_t::sindex_name() const {
 
 sindex_readgen_t::sindex_readgen_t(
     const std::map<std::string, wire_func_t> &global_optargs,
+    std::string table_name,
     const std::string &_sindex,
     datum_range_t range,
     profile_bool_t profile,
     sorting_t sorting)
-    : readgen_t(global_optargs, range, profile, sorting), sindex(_sindex) { }
+    : readgen_t(global_optargs, std::move(table_name), range, profile, sorting),
+      sindex(_sindex) { }
 
 scoped_ptr_t<readgen_t> sindex_readgen_t::make(
-    env_t *env, const std::string &sindex, datum_range_t range, sorting_t sorting) {
+    env_t *env,
+    std::string table_name,
+    const std::string &sindex,
+    datum_range_t range,
+    sorting_t sorting) {
     return scoped_ptr_t<readgen_t>(
         new sindex_readgen_t(
             env->global_optargs.get_all_optargs(),
-            sindex, range, env->profile(), sorting));
+            std::move(table_name),
+            sindex,
+            range,
+            env->profile(),
+            sorting));
 }
 
 class sindex_compare_t {
@@ -435,7 +452,7 @@ void sindex_readgen_t::sindex_sort(std::vector<rget_item_t> *vec) const {
         return;
     }
     if (sorting != sorting_t::UNORDERED) {
-        std::sort(vec->begin(), vec->end(), sindex_compare_t(sorting));
+        std::stable_sort(vec->begin(), vec->end(), sindex_compare_t(sorting));
     }
 }
 
@@ -446,6 +463,7 @@ rget_read_t sindex_readgen_t::next_read_impl(
     return rget_read_t(
         region_t::universe(),
         global_optargs,
+        table_name,
         batchspec,
         transforms,
         boost::optional<terminal_variant_t>(),
@@ -480,6 +498,7 @@ boost::optional<read_t> sindex_readgen_t::sindex_sort_read(
                     rget_read_t(
                         region_t::universe(),
                         global_optargs,
+                        table_name,
                         batchspec.with_new_batch_type(batch_type_t::SINDEX_CONSTANT),
                         transforms,
                         boost::optional<terminal_variant_t>(),
@@ -505,13 +524,13 @@ std::string sindex_readgen_t::sindex_name() const {
 
 counted_t<val_t> datum_stream_t::run_terminal(
     env_t *env, const terminal_variant_t &tv) {
-    scoped_ptr_t<eager_acc_t> acc(make_eager_terminal(env, tv));
+    scoped_ptr_t<eager_acc_t> acc(make_eager_terminal(tv));
     accumulate(env, acc.get(), tv);
     return acc->finish_eager(backtrace(), is_grouped());
 }
 
 counted_t<val_t> datum_stream_t::to_array(env_t *env) {
-    scoped_ptr_t<eager_acc_t> acc(make_to_array());
+    scoped_ptr_t<eager_acc_t> acc = make_to_array();
     accumulate_all(env, acc.get());
     return acc->finish_eager(backtrace(), is_grouped());
 }
@@ -526,17 +545,20 @@ counted_t<datum_stream_t> datum_stream_t::zip() {
 counted_t<datum_stream_t> datum_stream_t::indexes_of(counted_t<func_t> f) {
     return make_counted<indexes_of_datum_stream_t>(f, counted_from_this());
 }
+counted_t<datum_stream_t> datum_stream_t::ordered_distinct() {
+    return make_counted<ordered_distinct_datum_stream_t>(counted_from_this());
+}
 
 datum_stream_t::datum_stream_t(const protob_t<const Backtrace> &bt_src)
     : pb_rcheckable_t(bt_src), batch_cache_index(0), grouped(false) {
 }
 
-counted_t<datum_stream_t> datum_stream_t::add_grouping(
-    env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt) {
+void datum_stream_t::add_grouping(transform_variant_t &&tv,
+                                  const protob_t<const Backtrace> &bt) {
     check_not_grouped("Cannot call `group` on the output of `group` "
                       "(did you mean to `ungroup`?).");
     grouped = true;
-    return add_transformation(env, std::move(tv), bt);
+    add_transformation(std::move(tv), bt);
 }
 void datum_stream_t::check_not_grouped(const char *msg) {
     rcheck(!is_grouped(), base_exc_t::GENERIC, msg);
@@ -545,7 +567,9 @@ void datum_stream_t::check_not_grouped(const char *msg) {
 std::vector<counted_t<const datum_t> >
 datum_stream_t::next_batch(env_t *env, const batchspec_t &batchspec) {
     DEBUG_ONLY_CODE(env->do_eval_callback());
-    env->throw_if_interruptor_pulsed();
+    if (env->interruptor->is_pulsed()) {
+        throw interrupted_exc_t();
+    }
     // Cannot mix `next` and `next_batch`.
     r_sanity_check(batch_cache_index == 0 && batch_cache.size() == 0);
     check_not_grouped("Cannot treat the output of `group` as a stream "
@@ -585,11 +609,10 @@ bool datum_stream_t::batch_cache_exhausted() const {
     return batch_cache_index >= batch_cache.size();
 }
 
-counted_t<datum_stream_t> eager_datum_stream_t::add_transformation(
-    env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt) {
-    ops.emplace_back(make_op(env, tv));
+void eager_datum_stream_t::add_transformation(
+    transform_variant_t &&tv, const protob_t<const Backtrace> &bt) {
+    ops.push_back(make_op(std::move(tv)));
     update_bt(bt);
-    return counted_from_this();
 }
 
 eager_datum_stream_t::done_t eager_datum_stream_t::next_grouped_batch(
@@ -602,7 +625,7 @@ eager_datum_stream_t::done_t eager_datum_stream_t::next_grouped_batch(
         }
         (*out)[counted_t<const datum_t>()] = std::move(v);
         for (auto it = ops.begin(); it != ops.end(); ++it) {
-            (**it)(out, counted_t<const datum_t>());
+            (**it)(env, out, counted_t<const datum_t>());
         }
     }
     return done_t::NO;
@@ -613,14 +636,14 @@ void eager_datum_stream_t::accumulate(
     batchspec_t bs = batchspec_t::user(batch_type_t::TERMINAL, env);
     groups_t data;
     while (next_grouped_batch(env, bs, &data) == done_t::NO) {
-        (*acc)(&data);
+        (*acc)(env, &data);
     }
 }
 
 void eager_datum_stream_t::accumulate_all(env_t *env, eager_acc_t *acc) {
     groups_t data;
     done_t done = next_grouped_batch(env, batchspec_t::all(), &data);
-    (*acc)(&data);
+    (*acc)(env, &data);
     if (done == done_t::NO) {
         done_t must_be_yes = next_grouped_batch(env, batchspec_t::all(), &data);
         r_sanity_check(data.size() == 0);
@@ -636,7 +659,7 @@ eager_datum_stream_t::next_batch_impl(env_t *env, const batchspec_t &bs) {
 }
 
 counted_t<const datum_t> eager_datum_stream_t::as_array(env_t *env) {
-    if (is_grouped()) return counted_t<const datum_t>();
+    if (is_grouped() || !is_array()) return counted_t<const datum_t>();
     datum_ptr_t arr(datum_t::R_ARRAY);
     batchspec_t batchspec = batchspec_t::user(batch_type_t::TERMINAL, env);
     {
@@ -659,12 +682,10 @@ lazy_datum_stream_t::lazy_datum_stream_t(
       current_batch_offset(0),
       reader(*ns_access, use_outdated, std::move(readgen)) { }
 
-counted_t<datum_stream_t>
-lazy_datum_stream_t::add_transformation(
-    env_t *, transform_variant_t &&tv, const protob_t<const Backtrace> &bt) {
+void lazy_datum_stream_t::add_transformation(transform_variant_t &&tv,
+                                             const protob_t<const Backtrace> &bt) {
     reader.add_transformation(std::move(tv));
     update_bt(bt);
-    return counted_from_this();
 }
 
 void lazy_datum_stream_t::accumulate(
@@ -686,6 +707,9 @@ lazy_datum_stream_t::next_batch_impl(env_t *env, const batchspec_t &batchspec) {
 bool lazy_datum_stream_t::is_exhausted() const {
     return reader.is_finished() && batch_cache_exhausted();
 }
+bool lazy_datum_stream_t::is_cfeed() const {
+    return false;
+}
 
 array_datum_stream_t::array_datum_stream_t(counted_t<const datum_t> _arr,
                                            const protob_t<const Backtrace> &bt_source)
@@ -700,6 +724,9 @@ counted_t<const datum_t> array_datum_stream_t::next_arr_el() {
 
 bool array_datum_stream_t::is_exhausted() const {
     return index >= arr->size();
+}
+bool array_datum_stream_t::is_cfeed() const {
+    return false;
 }
 
 std::vector<counted_t<const datum_t> >
@@ -752,13 +779,34 @@ indexed_sort_datum_stream_t::next_raw_batch(env_t *env, const batchspec_t &batch
             if (index >= data.size()) {
                 return ret;
             }
-            std::sort(data.begin(), data.end(),
-                      std::bind(lt_cmp, env, &sampler,
-                                ph::_1, ph::_2));
+            std::stable_sort(data.begin(), data.end(),
+                             std::bind(lt_cmp, env, &sampler, ph::_1, ph::_2));
         }
         for (; index < data.size() && !batcher.should_send_batch(); ++index) {
             batcher.note_el(data[index]);
             ret.push_back(std::move(data[index]));
+        }
+    }
+    return ret;
+}
+
+// ORDERED_DISTINCT_DATUM_STREAM_T
+ordered_distinct_datum_stream_t::ordered_distinct_datum_stream_t(
+    counted_t<datum_stream_t> _source) : wrapper_datum_stream_t(_source) { }
+
+std::vector<counted_t<const datum_t> >
+ordered_distinct_datum_stream_t::next_raw_batch(env_t *env, const batchspec_t &bs) {
+    std::vector<counted_t<const datum_t> > ret;
+    profile::sampler_t sampler("Ordered distinct.", env->trace);
+    while (ret.size() == 0) {
+        std::vector<counted_t<const datum_t> > v = source->next_batch(env, bs);
+        if (v.size() == 0) break;
+        for (auto &&el : v) {
+            if (!last_val.has() || *last_val != *el) {
+                last_val = el;
+                ret.push_back(std::move(el));
+            }
+            sampler.new_sample();
         }
     }
     return ret;
@@ -843,6 +891,9 @@ bool slice_datum_stream_t::is_exhausted() const {
     return (left >= right || index >= right || source->is_exhausted())
         && batch_cache_exhausted();
 }
+bool slice_datum_stream_t::is_cfeed() const {
+    return source->is_cfeed();
+}
 
 // ZIP_DATUM_STREAM_T
 zip_datum_stream_t::zip_datum_stream_t(counted_t<datum_stream_t> _src)
@@ -865,13 +916,12 @@ zip_datum_stream_t::next_raw_batch(env_t *env, const batchspec_t &batchspec) {
 }
 
 // UNION_DATUM_STREAM_T
-counted_t<datum_stream_t> union_datum_stream_t::add_transformation(
-    env_t *env, transform_variant_t &&tv, const protob_t<const Backtrace> &bt) {
+void union_datum_stream_t::add_transformation(transform_variant_t &&tv,
+                                              const protob_t<const Backtrace> &bt) {
     for (auto it = streams.begin(); it != streams.end(); ++it) {
-        *it = (*it)->add_transformation(env, transform_variant_t(tv), bt);
+        (*it)->add_transformation(transform_variant_t(std::move(tv)), bt);
     }
     update_bt(bt);
-    return counted_from_this();
 }
 
 void union_datum_stream_t::accumulate(
@@ -920,13 +970,16 @@ bool union_datum_stream_t::is_exhausted() const {
     }
     return batch_cache_exhausted();
 }
+bool union_datum_stream_t::is_cfeed() const {
+    return is_cfeed_union;
+}
 
 std::vector<counted_t<const datum_t> >
 union_datum_stream_t::next_batch_impl(env_t *env, const batchspec_t &batchspec) {
     for (; streams_index < streams.size(); ++streams_index) {
         std::vector<counted_t<const datum_t> > batch
             = streams[streams_index]->next_batch(env, batchspec);
-        if (batch.size() != 0) {
+        if (batch.size() != 0 || streams[streams_index]->is_cfeed()) {
             return batch;
         }
     }

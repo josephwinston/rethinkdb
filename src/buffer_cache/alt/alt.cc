@@ -16,9 +16,11 @@ using alt::page_acq_t;
 using alt::page_cache_t;
 using alt::page_t;
 using alt::page_txn_t;
-using alt::tracker_acq_t;
+using alt::throttler_acq_t;
 
-const int SOFT_UNWRITTEN_CHANGES_LIMIT = 200;
+const int64_t MINIMUM_SOFT_UNWRITTEN_CHANGES_LIMIT = 1;
+const int64_t SOFT_UNWRITTEN_CHANGES_LIMIT = 4000;
+const double SOFT_UNWRITTEN_CHANGES_MEMORY_FRACTION = 0.5;
 
 // There are very few ASSERT_NO_CORO_WAITING calls (instead we have
 // ASSERT_FINITE_CORO_WAITING) because most of the time we're at the mercy of the
@@ -27,8 +29,7 @@ const int SOFT_UNWRITTEN_CHANGES_LIMIT = 200;
 
 
 // The intrusive list of alt_snapshot_node_t contains all the snapshot nodes for a
-// given block id, in order by version.  (See
-// cache_t::snapshot_nodes_by_block_id_.)
+// given block id, in order by version. (See cache_t::snapshot_nodes_by_block_id_.)
 class alt_snapshot_node_t : public intrusive_list_node_t<alt_snapshot_node_t> {
 public:
     explicit alt_snapshot_node_t(scoped_ptr_t<current_page_acq_t> &&acq);
@@ -42,7 +43,7 @@ private:
     // declare_snapshotted() called).
     scoped_ptr_t<current_page_acq_t> current_page_acq_;
 
-    // RSP: std::map memory usage.
+    // KSI: std::map memory usage.  Just use a vector of pairs?
     // A NULL pointer associated with a block id indicates that the block is deleted.
     std::map<block_id_t, alt_snapshot_node_t *> children_;
 
@@ -54,35 +55,44 @@ private:
     DISABLE_COPYING(alt_snapshot_node_t);
 };
 
-alt_memory_tracker_t::alt_memory_tracker_t()
-    : unwritten_changes_semaphore_(SOFT_UNWRITTEN_CHANGES_LIMIT) { }
-alt_memory_tracker_t::~alt_memory_tracker_t() { }
+alt_txn_throttler_t::alt_txn_throttler_t(int64_t minimum_unwritten_changes_limit)
+    : minimum_unwritten_changes_limit_(minimum_unwritten_changes_limit),
+      unwritten_changes_semaphore_(SOFT_UNWRITTEN_CHANGES_LIMIT) { }
 
-void alt_memory_tracker_t::inform_memory_change(UNUSED uint64_t in_memory_size,
-                                                UNUSED uint64_t memory_limit) {
-    // KSI: implement this (for issue 97).
-}
+alt_txn_throttler_t::~alt_txn_throttler_t() { }
 
-// KSI: An interface problem here is that this is measured in blocks while
-// inform_memory_change is measured in bytes.
-tracker_acq_t alt_memory_tracker_t::begin_txn_or_throttle(int64_t expected_change_count) {
-    tracker_acq_t acq;
+throttler_acq_t alt_txn_throttler_t::begin_txn_or_throttle(int64_t expected_change_count) {
+    throttler_acq_t acq;
     acq.semaphore_acq_.init(&unwritten_changes_semaphore_, expected_change_count);
     acq.semaphore_acq_.acquisition_signal()->wait();
     return acq;
 }
 
-void alt_memory_tracker_t::end_txn(UNUSED tracker_acq_t acq) {
+void alt_txn_throttler_t::end_txn(UNUSED throttler_acq_t acq) {
     // Just let the acq destructor do its thing.
 }
 
-cache_t::cache_t(serializer_t *serializer, const alt_cache_config_t &config,
+void alt_txn_throttler_t::inform_memory_limit_change(uint64_t memory_limit,
+                                                     const block_size_t max_block_size) {
+    int64_t throttler_limit = std::min<int64_t>(SOFT_UNWRITTEN_CHANGES_LIMIT,
+        (memory_limit / max_block_size.ser_value()) * SOFT_UNWRITTEN_CHANGES_MEMORY_FRACTION);
+
+    // Always provide at least one capacity in the semaphore
+    throttler_limit = std::max<int64_t>(throttler_limit, minimum_unwritten_changes_limit_);
+
+    unwritten_changes_semaphore_.set_capacity(throttler_limit);
+}
+
+cache_t::cache_t(serializer_t *serializer,
+                 cache_balancer_t *balancer,
                  perfmon_collection_t *perfmon_collection)
     : stats_(make_scoped<alt_cache_stats_t>(perfmon_collection)),
-      tracker_(),
-      page_cache_(serializer, config.page_config, &tracker_) { }
+      throttler_(MINIMUM_SOFT_UNWRITTEN_CHANGES_LIMIT),
+      page_cache_(serializer, balancer, &throttler_) { }
 
-cache_t::~cache_t() { }
+cache_t::~cache_t() {
+    guarantee(snapshot_nodes_by_block_id_.empty());
+}
 
 cache_account_t cache_t::create_cache_account(int priority) {
     return page_cache_.create_cache_account(priority);
@@ -92,8 +102,11 @@ alt_snapshot_node_t *
 cache_t::matching_snapshot_node_or_null(block_id_t block_id,
                                         block_version_t block_version) {
     ASSERT_NO_CORO_WAITING;
-    intrusive_list_t<alt_snapshot_node_t> *list
-        = &snapshot_nodes_by_block_id_[block_id];
+    auto list_it = snapshot_nodes_by_block_id_.find(block_id);
+    if (list_it == snapshot_nodes_by_block_id_.end()) {
+        return NULL;
+    }
+    intrusive_list_t<alt_snapshot_node_t> *list = &list_it->second;
     for (alt_snapshot_node_t *p = list->tail(); p != NULL; p = list->prev(p)) {
         if (p->current_page_acq_->block_version() == block_version) {
             return p;
@@ -123,7 +136,12 @@ void cache_t::remove_snapshot_node(block_id_t block_id, alt_snapshot_node_t *nod
         stack.pop();
         // Step 1. Remove the node to be deleted from its list in
         // snapshot_nodes_by_block_id_.
-        snapshot_nodes_by_block_id_[pair.first].remove(pair.second);
+        auto list_it = snapshot_nodes_by_block_id_.find(pair.first);
+        rassert(list_it != snapshot_nodes_by_block_id_.end());
+        list_it->second.remove(pair.second);
+        if (list_it->second.empty()) {
+            snapshot_nodes_by_block_id_.erase(list_it);
+        }
 
         const std::map<block_id_t, alt_snapshot_node_t *> children
             = std::move(pair.second->children_);
@@ -191,25 +209,25 @@ void txn_t::help_construct(repli_timestamp_t txn_timestamp,
                            cache_conn_t *cache_conn) {
     cache_->assert_thread();
     guarantee(expected_change_count >= 0);
-    tracker_acq_t tracker_acq
-        = cache_->tracker_.begin_txn_or_throttle(expected_change_count);
+    throttler_acq_t throttler_acq
+        = cache_->throttler_.begin_txn_or_throttle(expected_change_count);
 
     ASSERT_FINITE_CORO_WAITING;
 
     page_txn_.init(new page_txn_t(&cache_->page_cache_,
                                   txn_timestamp,
-                                  std::move(tracker_acq),
+                                  std::move(throttler_acq),
                                   cache_conn));
 }
 
-void txn_t::inform_tracker(cache_t *cache, tracker_acq_t *tracker_acq) {
-    cache->tracker_.end_txn(std::move(*tracker_acq));
+void txn_t::inform_tracker(cache_t *cache, throttler_acq_t *throttler_acq) {
+    cache->throttler_.end_txn(std::move(*throttler_acq));
 }
 
 void txn_t::pulse_and_inform_tracker(cache_t *cache,
-                                     tracker_acq_t *tracker_acq,
+                                     throttler_acq_t *throttler_acq,
                                      cond_t *pulsee) {
-    inform_tracker(cache, tracker_acq);
+    inform_tracker(cache, throttler_acq);
     pulsee->pulse();
 }
 
@@ -291,12 +309,12 @@ buf_lock_t::get_or_create_child_snapshot_node(cache_t *cache,
         // write transaction has not yet acquired [1].  So we create a child using
         // the current version of the block.
         //
-        // [1] assuming the cache is used proprely, with the child always acquired
+        // [1] assuming the cache is used properly, with the child always acquired
         // via the parent, or detached, before modification
         alt_snapshot_node_t *child = help_make_child(cache, child_id);
 
-        child->ref_count_++;
-        parent->children_.insert(std::make_pair(child_id, child));
+        // We don't attach the snapshot node to its parent, because this is a read
+        // transaction.
         return child;
     } else {
         return it->second;
@@ -324,9 +342,13 @@ void buf_lock_t::create_child_snapshot_attachments(cache_t *cache,
     // We create at most one child snapshot node.
 
     alt_snapshot_node_t *child = NULL;
-    intrusive_list_t<alt_snapshot_node_t> *list
-        = &cache->snapshot_nodes_by_block_id_[parent_id];
-    for (alt_snapshot_node_t *p = list->tail(); p != NULL; p = list->prev(p)) {
+    auto list_it = cache->snapshot_nodes_by_block_id_.find(parent_id);
+    if (list_it == cache->snapshot_nodes_by_block_id_.end()) {
+        return;
+    }
+    for (alt_snapshot_node_t *p = list_it->second.tail();
+         p != NULL;
+         p = list_it->second.prev(p)) {
         auto it = p->children_.find(child_id);
         if (it != p->children_.end()) {
             // Already has a child, continue.
@@ -341,6 +363,7 @@ void buf_lock_t::create_child_snapshot_attachments(cache_t *cache,
             child = help_make_child(cache, child_id);
         }
 
+        // Attach the child to its parent.
         child->ref_count_++;
         p->children_.insert(std::make_pair(child_id, child));
     }
@@ -352,10 +375,14 @@ void buf_lock_t::create_empty_child_snapshot_attachments(cache_t *cache,
                                                          block_id_t parent_id,
                                                          block_id_t child_id) {
     ASSERT_NO_CORO_WAITING;
-    intrusive_list_t<alt_snapshot_node_t> *list
-        = &cache->snapshot_nodes_by_block_id_[parent_id];
 
-    for (alt_snapshot_node_t *p = list->tail(); p != NULL; p = list->prev(p)) {
+    auto list_it = cache->snapshot_nodes_by_block_id_.find(parent_id);
+    if (list_it == cache->snapshot_nodes_by_block_id_.end()) {
+        return;
+    }
+    for (alt_snapshot_node_t *p = list_it->second.tail();
+         p != NULL;
+         p = list_it->second.prev(p)) {
         auto it = p->children_.find(child_id);
         if (it != p->children_.end()) {
             // Already has a child, continue.
@@ -376,6 +403,7 @@ void buf_lock_t::help_construct(buf_parent_t parent, block_id_t block_id,
     buf_lock_t::wait_for_parent(parent, access);
     ASSERT_FINITE_CORO_WAITING;
     if (parent.lock_or_null_ != NULL && parent.lock_or_null_->snapshot_node_ != NULL) {
+        rassert(access == access_t::read);
         buf_lock_t *parent_lock = parent.lock_or_null_;
         rassert(!parent_lock->current_page_acq_.has());
         snapshot_node_
